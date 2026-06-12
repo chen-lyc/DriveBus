@@ -1,0 +1,23 @@
+*.out
+
+# 构建产物 / 本地依赖 / 缓存
+build/
+gen/
+compile_commands.json
+node_modules/
+.cache/
+
+# 运行时日志
+logs/
+
+# 本地笔记 / AI 上下文
+.claude/
+.deepseek/
+.agents/
+.vscode/
+.codex
+.clang-format
+
+# 临时截图
+*.png
+core.*
