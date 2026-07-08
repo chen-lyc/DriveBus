@@ -1,8 +1,8 @@
-# EPOLLET + 预读：解决边缘触发竞态
+# 预读：解决 EPOLLET 初始化时序问题
 
 ## 问题
 
-`a.out`（消费者）和 `b.out`（生产者）通过 eventfd + EPOLLET 通知。初始化时序存在竞态：
+`a.out`（消费者）和 `b.out`（生产者）通过 eventfd + EPOLLET 通知。启动阶段存在一个时序问题——不是两个进程在赛跑，而是 EPOLLET 的语义本身：**它只报告 fd 状态变化的"边沿"，不主动报告"当前已经是可读状态"。**
 
 ```
 b.out:  send_fd(efd) ── 进入循环 ── write(efd, 1) ── write(efd, 1) ── ... ── exit
@@ -23,7 +23,7 @@ a.out:  recv_fd(efd) ── epoll_ctl(ADD, efd, EPOLLET) ── shm_open ── 
 event.events = EPOLLIN;  // 不设 EPOLLET
 ```
 
-水平触发：只要 fd 可读，就一直通知。没有竞态问题。
+水平触发：只要 fd 可读，就一直通知。没有这个时序问题。
 
 **缺点**：如果消费者没读完就返回 epoll_wait，会立刻再次被唤醒（忙等），需要配合非阻塞读 + 读空才返回的 discipline。
 

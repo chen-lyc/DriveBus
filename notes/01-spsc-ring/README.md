@@ -7,11 +7,11 @@
 | # | 文件 | 主题 |
 |---|------|------|
 | 1 | [01-data-race-vs-bounds-overflow.md](01-data-race-vs-bounds-overflow.md) | 两条独立的线：越界（单线程）vs Data Race（并发） |
-| 2 | [02-atomic-memory-order.md](02-atomic-memory-order.md) | atomic 管寄存器缓存，release/acquire 管 CPU 顺序，volatile 为什么不够 |
+| **2** | **[02-atomic-memory-order.md](02-atomic-memory-order.md)** ⭐ | **核心：闸门判据 — 什么时候用 relaxed，什么时候用 acquire/release** |
 | 3 | [03-ring-buffer-design.md](03-ring-buffer-design.md) | 满/空歧义，留一格设计，反压条件的数学推导 |
-| 4 | [04-epoll-preliminary-read.md](04-epoll-preliminary-read.md) | EPOLLET 边缘触发竞态，预读解法，eventfd 计数器语义，O_NONBLOCK 穿透 SCM_RIGHTS |
+| 4 | [04-epoll-preliminary-read.md](04-epoll-preliminary-read.md) | EPOLLET 初始化时序问题，预读解法，eventfd 计数器语义 |
 | 5 | [05-local-variables-and-while-vs-if.md](05-local-variables-and-while-vs-if.md) | 局部变量固定值（正确性前提）+ while vs if 选择 |
-| 6 | [06-unix-socket-shm-foundation.md](06-unix-socket-shm-foundation.md) | Linux IPC 基础：共享内存、Unix Socket、sendmsg/recvmsg 结构体体系、字符串与二进制约定 |
+| 6 | [06-unix-socket-shm-foundation.md](06-unix-socket-shm-foundation.md) | 📖 Linux IPC 语法基础：共享内存、Unix Socket、sendmsg/recvmsg 结构体体系 |
 
 ## 技术栈
 
