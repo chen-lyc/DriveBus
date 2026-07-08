@@ -66,6 +66,79 @@ char c = p->data[...];                                         // 普通读 ← 
 
 - **eventfd 的 `read`/`write` syscall**：内核代码中有内存屏障（spinlock、wake_up 等），在 x86 上是 full barrier，但在 C++ 抽象机层面，仍应依赖 `release/acquire` 而非隐含行为。
 
+## 为什么 b.cpp 的忙碌等待中 rd 要 acquire，wr 可以 relaxed
+
+### 看实际代码
+
+```cpp
+// b.cpp:104-109 忙碌等待
+int rd = p->offset_read.load(std::memory_order_acquire);   // acquire
+int wr = p->offset_write.load(memory_order_relaxed);        // relaxed
+while ((rd > wr && rd <= wr + len) || wr + len >= rd + sizeof(p->desc_ring)) {
+    this_thread::sleep_for(chrono::milliseconds(1));
+    rd = p->offset_read.load(std::memory_order_acquire);   // acquire
+    wr = p->offset_write.load(memory_order_relaxed);        // relaxed
+}
+```
+
+核心问题不是"谁写了这个变量"，也不是"同一进程还是不同进程"。而是 **同一线程内部的编译器保证重排之后的运行效果和代码逻辑一致 vs 跨线程不存在这种保证**。
+
+### `wr` 为什么可以 relaxed：同一线程的 as-if 规则
+
+`offset_write` 的写者就是 `b.out` 自己——同一个线程。C++ 语言有一条基本保证：**编译器/CPU 可以乱序执行，但单线程的"可观察行为"必须和顺序执行一致。** 这叫 as-if 规则。
+
+```
+b.out（同一线程）:
+  p->offset_write.store(64, release);   // 我写的
+  ...
+  wr = p->offset_write.load(relaxed);   // 我读
+  // → 必然读到 ≥ 64，因为"在同一个线程里，自己刚写的值自己还没看到"违反 as-if 规则
+```
+
+编译器即使做了各种优化和重排，也不能让同一个线程在 `store(64)` 之后读到比 64 更旧的值。这就是 `relaxed` 在这里够用的原因——**as-if 规则本身不会因 memory order 而改变**，它是对编译器的最低要求。
+
+### `rd` 为什么必须 acquire：跨线程没有 as-if 规则
+
+`offset_read` 的写者是 `a.out`，**这是另一个线程（另一个进程）**。C++ 的 as-if 规则只对单个线程成立，跨线程没有这种保证。
+
+```
+a.out（线程 A）:                         b.out（线程 B）:
+  write(1, p->data + rd, ...)   // ① 消费数据，释放缓冲区空间
+  p->offset_read.store(..., release)  // ② 公布新位置
+
+                                        rd = p->offset_read.load(acquire)  // ③
+                                        if (空间够) {
+                                            memcpy(p->data + wr, ...)  // ④
+                                        }
+```
+
+**如果没有 acquire**，CPU 的 store buffer 可能让 ② 先对其他核心可见，而 ① 还在 store buffer 里排队。结果：`b.out` 看到 `rd` 前进了，以为数据已经被消费了，但 `p->data[]` 里的内容在 `b.out` 看来还是旧的——③ 看到了 ②，却**没有**看到 ①。
+
+**`acquire` 保证**：③ 看到了 ② 的这个值，就一定也看到了 ① 及之前的所有内存操作。即 `rd` 前进了 → 对应的缓冲区空间确实已经释放了。
+
+```
+release/acquire 链条:
+
+a.out:   ① data 写入 ──→ ② offset_read.store(release)
+                              │
+                              │ happens-before
+                              ↓
+b.out:                     ③ offset_read.load(acquire) ──→ ④ 读 data
+```
+
+### 规律
+
+不是"同一进程用啥、不同进程用啥"。真正的判断标准：
+
+| 情况 | memory order |
+|------|-------------|
+| 读的是**别的线程**写的值 + 需要看见写者的其他内存操作 | `acquire` |
+| 读的是**自己线程**写的值 | `relaxed` 够用（as-if 规则兜底） |
+
+在 b.cpp 的忙碌等待中：
+- `rd`：a.out 写的，跨线程 → `acquire`，确保看到 a.out 写 `offset_read` 之前的所有内存操作（释放的缓冲区空间）
+- `wr`：自己写的，同线程 → `relaxed`，as-if 规则保证自己写的一定能看到
+
 ## 为什么 `volatile` 不够
 
 `volatile` 在 C++ 中只做一件事：**禁止编译器优化掉对该变量的读写**。它不提供：
