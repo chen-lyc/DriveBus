@@ -63,6 +63,8 @@ b.out（写方）:                           a.out（读方）:
 
 **`offset_write` 不是一道普通的数字。** 读端读到它变大，含义是"到这儿的数据字节写好了、能读了"——它守着 `data[]` 那块内存，是闸门。必须 `release/acquire`。
 
+**实践提示——先找 release。** `acquire` 和 `release` 只是配对，但 `release` 有明确的动作时刻——"我把某块内存写好了，现在宣布出去"。这个时刻在代码里一眼看得见：store 之前的那行 `memcpy`、`memset`、`write` 就是被守着的数据。而 `acquire` 侧是被动的，你只需要保证"凡有 `release`，对面读这个变量时配一个 `acquire`"——不会漏，因为写方的闸门时刻反过来定义了读方必须在哪儿过闸。
+
 ### 不守门：数字本身就是全部 → relaxed
 
 ```cpp

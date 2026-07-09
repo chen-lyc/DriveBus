@@ -41,11 +41,63 @@ int recv_fd(int sock) {
     return fd;
 }
 
-struct SharedData {
-    atomic<int> offset_read = 0;
-    atomic<int> offset_write = 0;
-    char data[64 * 26];
+struct MessageDesc {
+    int offset;
+    int len;
 };
+
+struct FreeListHeads {
+    atomic<int> offset_16;
+    int offset_128;
+    int offset_256;
+    int offset_512;
+    int offset_1024;
+};
+
+struct FreeListTails {
+    std::atomic<int> offset_16;
+    std::atomic<int> offset_128;
+    std::atomic<int> offset_256;
+    std::atomic<int> offset_512;
+    std::atomic<int> offset_1024;
+};
+
+const int kDescNum = 16;
+
+struct SharedData {
+    atomic<int> offset_read = 0;  // 还未读的第一个偏移量位置
+    atomic<int> offset_write = 0; // 还未写的第一个偏移量位置
+    // 同环次数已写区间 [rd, wr), 单位是描述符个数
+    MessageDesc desc_ring[kDescNum];
+    FreeListHeads head;
+    FreeListTails tail;
+    char data[1024 * 21];
+};
+
+const int kClassNum = 5;
+const int kClassSize[] = {16, 128, 256, 512, 1024};
+
+void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
+    for (int i = 0; i < n; i++) {
+        int offset = desc_ring[i].offset;
+        int len = desc_ring[i].len;
+
+        int idx = 0;
+        while (idx < kClassNum && len > kClassSize[idx]) ++idx;
+        if (idx > kClassNum) {
+            cout << "offset is " << offset << " len is " << len << ", over size" << endl;
+            continue;
+        }
+
+        cout << "read " << len << " byte, offset is " << offset << endl;
+        write(1, p->data + offset, len);
+        cout << endl;
+
+        int off_16 = p->tail.offset_16.load(memory_order_relaxed);
+        memcpy(p->data + off_16, &offset, sizeof(int));
+        p->tail.offset_16.store(offset, std::memory_order_release);
+    }
+}
 
 int main() {
     const string path = "/tmp/demo.sock";
@@ -81,14 +133,18 @@ int main() {
         return 1;
     }
     SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    
+
     uint64_t val;
     ssize_t n = read(efd, &val, sizeof(val));
     if (n > 0) {
         int rd = p->offset_read.load(memory_order_relaxed);
         int wr = p->offset_write.load(std::memory_order_acquire);
         while (wr > rd) {
-            write(1, p->data + rd, wr - rd);
+            int num = wr - rd;
+            MessageDesc desc_ring[num];
+            copy(p->desc_ring + rd, p->desc_ring + wr, desc_ring);
+            read_data(p, desc_ring, num);
+
             rd = wr;
             p->offset_read.store(wr, std::memory_order_release);
             wr = p->offset_write.load(std::memory_order_acquire);
@@ -116,14 +172,22 @@ int main() {
                 int rd = p->offset_read.load(memory_order_relaxed);
                 int wr = p->offset_write.load(std::memory_order_acquire);
                 if (rd > wr) {
-                    write(1, p->data + rd, sizeof(p->data) - rd);
+                    int num = kDescNum - rd;
+                    MessageDesc desc_ring[num];
+                    copy(p->desc_ring + rd, p->desc_ring + kDescNum, desc_ring);
+                    read_data(p, desc_ring, num);
+
                     p->offset_read.store(0, std::memory_order_release);
                 }
 
                 wr = p->offset_write.load(std::memory_order_acquire);
                 rd = p->offset_read.load(memory_order_relaxed);
                 while (wr > rd) {
-                    write(1, p->data + rd, wr - rd);
+                    int num = wr - rd;
+                    MessageDesc desc_ring[num];
+                    copy(p->desc_ring + rd, p->desc_ring + wr, desc_ring);
+                    read_data(p, desc_ring, num);
+
                     rd = wr;
                     p->offset_read.store(wr, std::memory_order_release);
                     wr = p->offset_write.load(std::memory_order_acquire);
@@ -133,6 +197,7 @@ int main() {
         }
         this_thread::sleep_for(chrono::milliseconds(1));
     }
+
     munmap(p, sizeof(SharedData));
     shm_unlink("/shm");
     close(fd);
