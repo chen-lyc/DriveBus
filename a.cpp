@@ -208,6 +208,9 @@ int main() {
         this_thread::sleep_for(chrono::milliseconds(1));
     }
 
+    write(1, p->data, sizeof(p->data));
+    cout << endl;
+
     munmap(p, sizeof(SharedData));
     shm_unlink("/shm");
     close(fd);

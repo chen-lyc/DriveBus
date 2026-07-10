@@ -4,13 +4,6 @@
 #include <iostream>
 #include <random>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <fcntl.h>
 #include <stdint.h>
 using namespace std;
 
@@ -31,32 +24,6 @@ int get_msg_size() {
     } else {
         return big_dist(gen);
     }
-}
-
-void send_fd(int sock, int fd) {
-    struct msghdr msg{};
-
-    char dummy = 'F';
-    struct iovec iov;
-    iov.iov_base = &dummy;
-    iov.iov_len = sizeof(dummy);
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    char control[CMSG_SPACE(sizeof(int))];
-    memset(control, 0, sizeof(control));
-
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-
-    *reinterpret_cast<int *>(CMSG_DATA(cmsg)) = fd;
-    sendmsg(sock, &msg, 0);
 }
 
 struct MessageDesc {
@@ -105,6 +72,36 @@ const int kInvalidOffset = -1;
 
 const int kMagic = 21354532;
 
+void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
+    for (int i = 0; i < n; i++) {
+        int offset = desc_ring[i].offset;
+        int len = desc_ring[i].len;
+
+        int idx = 0;
+        while (idx < kClassNum && len > kClassSize[idx]) ++idx;
+        if (idx > kClassNum) {
+            // cout << "offset is " << offset << " len is " << len << ", over size" << endl;
+            continue;
+        }
+
+        int magic, seq;
+        memcpy(&magic, p->data + offset, sizeof(int));
+        memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
+        // cout << "read " << len << " byte, offset is " << offset << ", seq is " << seq << endl;
+        if (magic != kMagic) {
+            cout << "error magic: " << magic << ", seq is " << seq << endl;
+        }
+        if (len > 2 * sizeof(int)) {
+            write(1, p->data + offset + 2 * sizeof(int), len - 2 * sizeof(int));
+        }
+        // cout << endl;
+
+        int last_tail_off_16 = p->tail.offset_16.load(memory_order_relaxed);
+        memcpy(p->data + last_tail_off_16, &offset, sizeof(int));
+        p->tail.offset_16.store(offset, std::memory_order_release);
+    }
+}
+
 void shm_init(SharedData &shm) {
     shm.offset_read.store(0, memory_order_relaxed);
     shm.offset_write.store(0, memory_order_relaxed);
@@ -132,35 +129,47 @@ void shm_init(SharedData &shm) {
     init(1024, kMemorySize_1024, shm.head.offset_1024);
 }
 
-int main() {
-    shm_unlink("/shm");
-    int fd = shm_open("/shm", O_CREAT | O_RDWR, 0666);
-    ftruncate(fd, sizeof(SharedData));
-    SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+void run_a(SharedData *p) {
+    int consumed = 0;
+    while (consumed < 26 * 100) {
+        int rd = p->offset_read.load(memory_order_relaxed);
+        int wr = p->offset_write.load(std::memory_order_acquire);
+        if (rd == wr) {
+            continue;
+        }
 
-    shm_init(*p);
+        if (rd > wr) {
+            int num = kDescNum - rd;
+            MessageDesc desc_ring[num];
+            copy(p->desc_ring + rd, p->desc_ring + kDescNum, desc_ring);
+            read_data(p, desc_ring, num);
+            consumed += num;
 
-    const string path = "/tmp/demo.sock";
+            p->offset_read.store(0, std::memory_order_release);
+        }
 
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        wr = p->offset_write.load(std::memory_order_acquire);
+        rd = p->offset_read.load(memory_order_relaxed);
+        if (wr > rd) {
+            int num = wr - rd;
+            MessageDesc desc_ring[num];
+            copy(p->desc_ring + rd, p->desc_ring + wr, desc_ring);
+            read_data(p, desc_ring, num);
+            consumed += num;
 
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, path.c_str());
-
-    int ret = connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-    int fail_num = 0;
-    while (ret < 0 && fail_num < 3) {
-        sleep(1);
-        ++fail_num;
-        ret = connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+            rd = wr;
+            p->offset_read.store(wr, std::memory_order_release);
+            wr = p->offset_write.load(std::memory_order_acquire);
+        }
+        // cout << "read over" << endl;
     }
-    if (ret < 0) return -1;
 
-    int efd = eventfd(0, EFD_NONBLOCK);
-    send_fd(sock, efd);
+    write(1, p->data, sizeof(p->data));
+    cout << endl;
+}
 
-    int task_num = 26 * 3;
+void run_b(SharedData *p) {
+    int task_num = 26 * 100;
     int seq = 0;
     for (char c = 'a'; task_num; c++) {
         int len = get_msg_size();
@@ -169,7 +178,6 @@ int main() {
         int rd = p->offset_read.load(std::memory_order_acquire);
         int wr = p->offset_write.load(memory_order_relaxed);
         while ((rd > wr && rd <= wr + 1) || wr + 1 >= rd + kDescNum) {
-            this_thread::sleep_for(chrono::milliseconds(1));
             rd = p->offset_read.load(std::memory_order_acquire);
             wr = p->offset_write.load(memory_order_relaxed);
         }
@@ -177,7 +185,6 @@ int main() {
         int head_off_16 = p->head.offset_16.load(memory_order_relaxed);
         int tail_off_16 = p->tail.offset_16.load(std::memory_order_acquire);
         while (head_off_16 == tail_off_16) {
-            this_thread::sleep_for(chrono::milliseconds(1));
             tail_off_16 = p->tail.offset_16.load(std::memory_order_acquire);
         }
         int next_head_off_16;
@@ -198,21 +205,25 @@ int main() {
         if (candidate >= kDescNum) p->offset_write.store(candidate % kDescNum, std::memory_order_release);
         else p->offset_write.store(candidate, std::memory_order_release);
 
-        uint64_t val = 1;
-        write(efd, &val, sizeof(val));
-        cout << "write " << len << " byte " << c << endl;
+        // cout << "write " << len << " byte " << c << endl;
         --task_num;
         // cout << "data: ";
         // write(1, p->data, sizeof(p->data));
         // cout << endl;
         if (c == 'z') c = 'a' - 1;
     }
-    uint64_t val = 1;
-    write(efd, &val, sizeof(val));
     cout << "all write over" << endl;
+}
 
-    munmap(p, sizeof(SharedData));
-    close(fd);
+int main() {
+    SharedData shm{};
+    shm_init(shm);
+
+    thread a_thread(run_a, &shm);
+    thread b_thread(run_b, &shm);
+
+    b_thread.join();
+    a_thread.join();
 
     return 0;
 }
