@@ -77,6 +77,8 @@ struct SharedData {
 const int kClassNum = 5;
 const int kClassSize[] = {16, 128, 256, 512, 1024};
 
+const int kMagic = 21354532;
+
 void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
     for (int i = 0; i < n; i++) {
         int offset = desc_ring[i].offset;
@@ -89,12 +91,20 @@ void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
             continue;
         }
 
-        cout << "read " << len << " byte, offset is " << offset << endl;
-        write(1, p->data + offset, len);
+        int magic, seq;
+        memcpy(&magic, p->data + offset, sizeof(int));
+        memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
+        cout << "read " << len << " byte, offset is " << offset << ", seq is " << seq << endl;
+        if (magic != kMagic) {
+            cout << "error magic: " << magic << ", seq is " << seq << endl;
+        }
+        if (len > 2 * sizeof(int)) {
+            write(1, p->data + offset + 2 * sizeof(int), len - 2 * sizeof(int));
+        }
         cout << endl;
 
-        int off_16 = p->tail.offset_16.load(memory_order_relaxed);
-        memcpy(p->data + off_16, &offset, sizeof(int));
+        int last_tail_off_16 = p->tail.offset_16.load(memory_order_relaxed);
+        memcpy(p->data + last_tail_off_16, &offset, sizeof(int));
         p->tail.offset_16.store(offset, std::memory_order_release);
     }
 }

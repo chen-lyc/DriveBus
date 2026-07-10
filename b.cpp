@@ -103,6 +103,8 @@ const int kMemorySize_1024 = 8;
 
 const int kInvalidOffset = -1;
 
+const int kMagic = 21354532;
+
 void shm_init(SharedData &shm) {
     shm.offset_read.store(0, memory_order_relaxed);
     shm.offset_write.store(0, memory_order_relaxed);
@@ -159,6 +161,7 @@ int main() {
     send_fd(sock, efd);
 
     int task_num = 26 * 3;
+    int seq = 0;
     for (char c = 'a'; task_num; c++) {
         // int len = get_msg_size();
         int len = 16;
@@ -184,16 +187,24 @@ int main() {
         MessageDesc desc{head_off_16, len};
         memcpy(p->desc_ring + wr, &desc, sizeof(MessageDesc));
 
-        memset(p->data + head_off_16, c, len);
+        memcpy(p->data + head_off_16, &kMagic, sizeof(int));
+        memcpy(p->data + head_off_16 + sizeof(int), &seq, sizeof(int));
+        ++seq;
+        if (len > 2 * sizeof(int)) {
+            memset(p->data + head_off_16 + 2 * sizeof(int), c, len - 2 * sizeof(int));
+        }
 
         int candidate = wr + 1;
-        if (candidate >= sizeof(p->desc_ring)) p->offset_write.store(candidate % sizeof(p->desc_ring), std::memory_order_release);
+        if (candidate >= kDescNum) p->offset_write.store(candidate % kDescNum, std::memory_order_release);
         else p->offset_write.store(candidate, std::memory_order_release);
 
         uint64_t val = 1;
         write(efd, &val, sizeof(val));
         cout << "write " << len << " byte " << c << endl;
         --task_num;
+        // cout << "data: ";
+        // write(1, p->data, sizeof(p->data));
+        // cout << endl;
         if (c == 'z') c = 'a' - 1;
     }
     uint64_t val = 1;
