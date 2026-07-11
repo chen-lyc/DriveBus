@@ -13,6 +13,7 @@
 | 5 | [05-epoll-preliminary-read.md](05-epoll-preliminary-read.md) | EPOLLET 初始化时序问题，预读解法，eventfd 计数器语义 |
 | 6 | [06-local-variables-and-while-vs-if.md](06-local-variables-and-while-vs-if.md) | 局部变量固定值（正确性前提）+ while vs if 选择 |
 | 7 | [07-unix-socket-shm-foundation.md](07-unix-socket-shm-foundation.md) | 📖 Linux IPC 语法基础：共享内存、Unix Socket、sendmsg/recvmsg 结构体体系 |
+| 8 | [08-pthread-mutex-in-shm.md](08-pthread-mutex-in-shm.md) | 共享内存中嵌入 pthread_mutex_t：PTHREAD_PROCESS_SHARED、API 流程、与 atomic 的配合 |
 
 ## 技术栈
 

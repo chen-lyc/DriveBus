@@ -62,7 +62,21 @@ struct FreeListTails {
     std::atomic<int> offset_1024;
 };
 
+const int kClassNum = 5;
+constexpr int kClassSize[] = {16, 128, 256, 512, 1024};
+
+const int kMemorySize_16 = 64;
+const int kMemorySize_128 = 32;
+const int kMemorySize_256 = 16;
+const int kMemorySize_512 = 8;
+const int kMemorySize_1024 = 8;
+
 const int kDescNum = 16;
+
+struct Outstanding {
+    pthread_mutex_t mutex;
+    bool chunk_16[kMemorySize_16];
+};
 
 struct SharedData {
     atomic<int> offset_read = 0;  // 还未读的第一个偏移量位置
@@ -72,15 +86,16 @@ struct SharedData {
     FreeListHeads head;
     FreeListTails tail;
     char data[1024 * 21];
-};
 
-const int kClassNum = 5;
-const int kClassSize[] = {16, 128, 256, 512, 1024};
+    Outstanding outstanding;
+};
 
 const int kMagic = 21354532;
 
+int expected_seq = 0;
+
 void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; ++i) {
         int offset = desc_ring[i].offset;
         int len = desc_ring[i].len;
 
@@ -96,12 +111,33 @@ void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
         memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
         cout << "read " << len << " byte, offset is " << offset << ", seq is " << seq << endl;
         if (magic != kMagic) {
-            cout << "error magic: " << magic << ", seq is " << seq << endl;
+            cout << "error magic: expected is" << kMagic << ", actual is " << magic << endl;
+            exit(1);
+        }
+        if (seq != expected_seq) {
+            cout << "error seq: " << " expected is " << expected_seq << ", actual is " << seq << endl;
+            exit(1);
         }
         if (len > 2 * sizeof(int)) {
             write(1, p->data + offset + 2 * sizeof(int), len - 2 * sizeof(int));
         }
         cout << endl;
+
+        ++expected_seq;
+
+        {
+            pthread_mutex_lock(&p->outstanding.mutex);
+
+            int idx = offset / 16;
+            // cout << "the " << idx << " chunk free" << endl;
+            if (p->outstanding.chunk_16[idx] == false) {
+                cout << "the " << idx << " chunk free twice" << endl;
+                exit(1);
+            }
+            p->outstanding.chunk_16[idx] = false;
+
+            pthread_mutex_unlock(&p->outstanding.mutex);
+        }
 
         int last_tail_off_16 = p->tail.offset_16.load(memory_order_relaxed);
         memcpy(p->data + last_tail_off_16, &offset, sizeof(int));
@@ -173,7 +209,7 @@ int main() {
             break;
         }
 
-        for (int i = 0; i < num; i++) {
+        for (int i = 0; i < num; ++i) {
             int fd = events[i].data.fd;
             if (fd == efd) {
                 uint64_t val;
@@ -210,6 +246,19 @@ int main() {
 
     write(1, p->data, sizeof(p->data));
     cout << endl;
+
+    {
+        pthread_mutex_lock(&p->outstanding.mutex);
+
+        for (int i = 0; i < kMemorySize_16; ++i) {
+            if (p->outstanding.chunk_16[i] == true) {
+                cout << "the " << i << " chunk not freee" << endl;
+            }
+        }
+
+        pthread_mutex_unlock(&p->outstanding.mutex);
+    }
+    pthread_mutex_destroy(&p->outstanding.mutex);
 
     munmap(p, sizeof(SharedData));
     shm_unlink("/shm");

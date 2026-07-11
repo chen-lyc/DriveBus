@@ -82,18 +82,8 @@ struct FreeListTails {
 
 const int kDescNum = 16;
 
-struct SharedData {
-    atomic<int> offset_read = 0;  // 还未读的第一个偏移量位置
-    atomic<int> offset_write = 0; // 还未写的第一个偏移量位置
-    // 同环次数已写区间 [rd, wr), 单位是描述符个数
-    MessageDesc desc_ring[kDescNum];
-    FreeListHeads head;
-    FreeListTails tail;
-    char data[1024 * 21];
-};
-
 const int kClassNum = 5;
-const int kClassSize[] = {16, 128, 256, 512, 1024};
+constexpr int kClassSize[] = {16, 128, 256, 512, 1024};
 
 const int kMemorySize_16 = 64;
 const int kMemorySize_128 = 32;
@@ -104,6 +94,36 @@ const int kMemorySize_1024 = 8;
 const int kInvalidOffset = -1;
 
 const int kMagic = 21354532;
+
+const int kFirstOffset16 = 0;
+const int kLastOffset16 = 16 * (kMemorySize_16 - 1);
+
+struct Outstanding {
+    pthread_mutex_t mutex;
+    bool chunk_16[kMemorySize_16];
+};
+
+struct SharedData {
+    atomic<int> offset_read = 0;  // 还未读的第一个偏移量位置
+    atomic<int> offset_write = 0; // 还未写的第一个偏移量位置
+    // 同环次数已写区间 [rd, wr), 单位是描述符个数
+    MessageDesc desc_ring[kDescNum];
+    FreeListHeads head;
+    FreeListTails tail;
+    char data[1024 * 21];
+
+    Outstanding outstanding;
+};
+
+void outstanding_init(Outstanding &outstanding) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&outstanding.mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    memset(outstanding.chunk_16, 0, kMemorySize_16);
+}
 
 void shm_init(SharedData &shm) {
     shm.offset_read.store(0, memory_order_relaxed);
@@ -118,7 +138,7 @@ void shm_init(SharedData &shm) {
     shm.tail.offset_16.store(16 * (kMemorySize_16 - 1), memory_order_relaxed);
 
     auto init = [&](int size, const int kMemorySize, int offset) {
-        for (int i = 0; i < kMemorySize; i++) {
+        for (int i = 0; i < kMemorySize; ++i) {
             int next_offset = offset + size;
             memcpy(shm.data + offset, &next_offset, sizeof(int));
             offset = next_offset;
@@ -139,6 +159,7 @@ int main() {
     SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
 
     shm_init(*p);
+    outstanding_init(p->outstanding);
 
     const string path = "/tmp/demo.sock";
 
@@ -160,9 +181,9 @@ int main() {
     int efd = eventfd(0, EFD_NONBLOCK);
     send_fd(sock, efd);
 
-    int task_num = 26 * 3;
+    int task_num = 26 * 3000;
     int seq = 0;
-    for (char c = 'a'; task_num; c++) {
+    for (char c = 'a'; task_num; ++c) {
         int len = get_msg_size();
         // int len = 16;
 
@@ -194,6 +215,27 @@ int main() {
             memset(p->data + head_off_16 + 2 * sizeof(int), c, len - 2 * sizeof(int));
         }
 
+        {
+            if (head_off_16 < kFirstOffset16 || head_off_16 > kLastOffset16) {
+                cout << "offset is out of range: head_off_16 is " << head_off_16 << endl;
+                return -1;
+            }
+
+            pthread_mutex_lock(&p->outstanding.mutex);
+
+            int idx = head_off_16 / 16;
+            if (p->outstanding.chunk_16[idx] == true) {
+                cout << "the " << idx << " chunk error use again" << endl;
+                pthread_mutex_unlock(&p->outstanding.mutex);
+                return 1;
+            } else {
+                // cout << "the " << idx << " chunk using" << endl;
+                p->outstanding.chunk_16[idx] = true;
+            }
+
+            pthread_mutex_unlock(&p->outstanding.mutex);
+        }
+
         int candidate = wr + 1;
         if (candidate >= kDescNum) p->offset_write.store(candidate % kDescNum, std::memory_order_release);
         else p->offset_write.store(candidate, std::memory_order_release);
@@ -202,9 +244,6 @@ int main() {
         write(efd, &val, sizeof(val));
         cout << "write " << len << " byte " << c << endl;
         --task_num;
-        // cout << "data: ";
-        // write(1, p->data, sizeof(p->data));
-        // cout << endl;
         if (c == 'z') c = 'a' - 1;
     }
     uint64_t val = 1;
