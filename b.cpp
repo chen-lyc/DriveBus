@@ -19,15 +19,15 @@ int get_msg_size() {
     mt19937 gen(rd());
 
     const int K = 1;
-    const int M = 1 * 2;
+    const int M = 1;
 
     uniform_int_distribution<int> choose(0, 1);
 
     uniform_int_distribution<int> small_dist(8 * K, 16 * K);
-    uniform_int_distribution<int> big_dist(64 * M, 512 * M);
+    uniform_int_distribution<int> big_dist(128 * M, 1024 * M);
 
-    return small_dist(gen);
     if (choose(gen) == 0) {
+        return small_dist(gen);
     } else {
         return big_dist(gen);
     }
@@ -59,31 +59,12 @@ void send_fd(int sock, int fd) {
     sendmsg(sock, &msg, 0);
 }
 
-struct MessageDesc {
-    int offset;
-    int len;
-};
-
-struct FreeListHeads {
-    atomic<int> offset_16;
-    int offset_128;
-    int offset_256;
-    int offset_512;
-    int offset_1024;
-};
-
-struct FreeListTails {
-    std::atomic<int> offset_16;
-    std::atomic<int> offset_128;
-    std::atomic<int> offset_256;
-    std::atomic<int> offset_512;
-    std::atomic<int> offset_1024;
-};
-
 const int kDescNum = 16;
 
 const int kClassNum = 5;
 constexpr int kClassSize[] = {16, 128, 256, 512, 1024};
+
+const int kMemorySize[] = {64, 32, 16, 8, 8};
 
 const int kMemorySize_16 = 64;
 const int kMemorySize_128 = 32;
@@ -91,16 +72,51 @@ const int kMemorySize_256 = 16;
 const int kMemorySize_512 = 8;
 const int kMemorySize_1024 = 8;
 
+const int kDataSize = 1024 * 21;
+
 const int kInvalidOffset = -1;
 
 const int kMagic = 21354532;
 
-const int kFirstOffset16 = 0;
-const int kLastOffset16 = 16 * (kMemorySize_16 - 1);
+const int kFirstOffset[] = {
+    0,
+    16 * 64,
+    16 * 64 + 128 * 32,
+    16 * 64 + 128 * 32 + 256 * 16,
+    16 * 64 + 128 * 32 + 256 * 16 + 512 * 8};
+const int kLastOffset[] = {
+    kFirstOffset[1] - kClassSize[0],
+    kFirstOffset[2] - kClassSize[1],
+    kFirstOffset[3] - kClassSize[2],
+    kFirstOffset[4] - kClassSize[3],
+    kDataSize - kClassSize[4],
+};
+
+int size_class_for(int size) {
+    for (int i = 0; i < kClassNum; ++i) {
+        if (size <= kClassSize[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+struct MessageDesc {
+    int offset;
+    int len;
+};
+
+struct FreeListHeads {
+    std::atomic<int> offset[kClassNum];
+};
+
+struct FreeListTails {
+    std::atomic<int> offset[kClassNum];
+};
 
 struct Outstanding {
     pthread_mutex_t mutex;
-    bool chunk_16[kMemorySize_16];
+    bool chunk[kClassNum][1024 * kMemorySize_1024];
 };
 
 struct SharedData {
@@ -122,34 +138,34 @@ void outstanding_init(Outstanding &outstanding) {
     pthread_mutex_init(&outstanding.mutex, &attr);
     pthread_mutexattr_destroy(&attr);
 
-    memset(outstanding.chunk_16, 0, kMemorySize_16);
+    memset(outstanding.chunk, 0, sizeof(outstanding.chunk));
 }
 
 void shm_init(SharedData &shm) {
     shm.offset_read.store(0, memory_order_relaxed);
     shm.offset_write.store(0, memory_order_relaxed);
 
-    shm.head.offset_16.store(0, memory_order_relaxed);
-    shm.head.offset_128 = shm.head.offset_16.load(memory_order_relaxed) + 16 * kMemorySize_16;
-    shm.head.offset_256 = shm.head.offset_128 + 128 * kMemorySize_128;
-    shm.head.offset_512 = shm.head.offset_256 + 256 * kMemorySize_256;
-    shm.head.offset_1024 = shm.head.offset_512 + 512 * kMemorySize_512;
+    shm.head.offset[0].store(0, memory_order_relaxed);
+    for (int i = 1; i < kClassNum; ++i) {
+        shm.head.offset[i].store(shm.head.offset[i - 1].load(memory_order_relaxed) + kClassSize[i - 1] * kMemorySize[i - 1], memory_order_relaxed);
+    }
 
-    shm.tail.offset_16.store(16 * (kMemorySize_16 - 1), memory_order_relaxed);
+    for (int i = 0; i < kClassNum - 1; ++i) {
+        shm.tail.offset[i].store(shm.head.offset[i + 1].load(memory_order_relaxed) - kClassSize[i], memory_order_relaxed);
+    }
+    shm.tail.offset[kClassNum - 1].store(sizeof(shm.data) - kClassSize[kClassNum - 1], memory_order_relaxed);
 
     auto init = [&](int size, const int kMemorySize, int offset) {
-        for (int i = 0; i < kMemorySize; ++i) {
+        for (int i = 0; i < kMemorySize - 1; ++i) {
             int next_offset = offset + size;
             memcpy(shm.data + offset, &next_offset, sizeof(int));
             offset = next_offset;
         }
         memcpy(shm.data + offset, &kInvalidOffset, sizeof(int));
     };
-    init(16, kMemorySize_16, 0);
-    init(128, kMemorySize_128, shm.head.offset_128);
-    init(256, kMemorySize_256, shm.head.offset_256);
-    init(512, kMemorySize_512, shm.head.offset_512);
-    init(1024, kMemorySize_1024, shm.head.offset_1024);
+    for (int i = 0; i < kClassNum; ++i) {
+        init(kClassSize[i], kMemorySize[i], shm.head.offset[i]);
+    }
 }
 
 int main() {
@@ -185,7 +201,11 @@ int main() {
     int seq = 0;
     for (char c = 'a'; task_num; ++c) {
         int len = get_msg_size();
-        // int len = 16;
+        int size_class = size_class_for(len);
+        if (size_class == -1) {
+            cout << "seq is " << seq << " size is " << len << ": size is too big" << endl;
+            return 1;
+        }
 
         int rd = p->offset_read.load(std::memory_order_acquire);
         int wr = p->offset_write.load(memory_order_relaxed);
@@ -195,42 +215,42 @@ int main() {
             wr = p->offset_write.load(memory_order_relaxed);
         }
 
-        int head_off_16 = p->head.offset_16.load(memory_order_relaxed);
-        int tail_off_16 = p->tail.offset_16.load(std::memory_order_acquire);
-        while (head_off_16 == tail_off_16) {
+        int head_off = p->head.offset[size_class].load(memory_order_relaxed);
+        int tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
+        while (head_off == tail_off) {
             this_thread::sleep_for(chrono::milliseconds(1));
-            tail_off_16 = p->tail.offset_16.load(std::memory_order_acquire);
+            tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
         }
-        int next_head_off_16;
-        memcpy(&next_head_off_16, p->data + head_off_16, sizeof(int));
-        p->head.offset_16.store(next_head_off_16, memory_order_relaxed);
+        int next_head_off;
+        memcpy(&next_head_off, p->data + head_off, sizeof(int));
+        p->head.offset[size_class].store(next_head_off, memory_order_relaxed);
 
-        MessageDesc desc{head_off_16, len};
+        MessageDesc desc{head_off, len};
         memcpy(p->desc_ring + wr, &desc, sizeof(MessageDesc));
 
-        memcpy(p->data + head_off_16, &kMagic, sizeof(int));
-        memcpy(p->data + head_off_16 + sizeof(int), &seq, sizeof(int));
+        memcpy(p->data + head_off, &kMagic, sizeof(int));
+        memcpy(p->data + head_off + sizeof(int), &seq, sizeof(int));
         ++seq;
         if (len > 2 * sizeof(int)) {
-            memset(p->data + head_off_16 + 2 * sizeof(int), c, len - 2 * sizeof(int));
+            memset(p->data + head_off + 2 * sizeof(int), c, len - 2 * sizeof(int));
         }
 
         {
-            if (head_off_16 < kFirstOffset16 || head_off_16 > kLastOffset16) {
-                cout << "offset is out of range: head_off_16 is " << head_off_16 << endl;
+            if (head_off < kFirstOffset[size_class] || head_off > kLastOffset[size_class]) {
+                cout << "size_class " << size_class << " offset is out of range: head_off is " << head_off << endl;
                 return -1;
             }
 
             pthread_mutex_lock(&p->outstanding.mutex);
 
-            int idx = head_off_16 / 16;
-            if (p->outstanding.chunk_16[idx] == true) {
-                cout << "the " << idx << " chunk error use again" << endl;
+            int idx = head_off / kClassSize[size_class];
+            if (p->outstanding.chunk[size_class][idx] == true) {
+                cout << "size_class " << size_class << " the " << idx << " chunk error use again" << endl;
                 pthread_mutex_unlock(&p->outstanding.mutex);
                 return 1;
             } else {
-                // cout << "the " << idx << " chunk using" << endl;
-                p->outstanding.chunk_16[idx] = true;
+                // cout << "size_class " << size_class <<"the " << idx << " chunk using" << endl;
+                p->outstanding.chunk[size_class][idx] = true;
             }
 
             pthread_mutex_unlock(&p->outstanding.mutex);

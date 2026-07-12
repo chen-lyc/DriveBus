@@ -41,29 +41,12 @@ int recv_fd(int sock) {
     return fd;
 }
 
-struct MessageDesc {
-    int offset;
-    int len;
-};
-
-struct FreeListHeads {
-    atomic<int> offset_16;
-    int offset_128;
-    int offset_256;
-    int offset_512;
-    int offset_1024;
-};
-
-struct FreeListTails {
-    std::atomic<int> offset_16;
-    std::atomic<int> offset_128;
-    std::atomic<int> offset_256;
-    std::atomic<int> offset_512;
-    std::atomic<int> offset_1024;
-};
+const int kDescNum = 16;
 
 const int kClassNum = 5;
 constexpr int kClassSize[] = {16, 128, 256, 512, 1024};
+
+const int kMemorySize[] = {64, 32, 16, 8, 8};
 
 const int kMemorySize_16 = 64;
 const int kMemorySize_128 = 32;
@@ -71,11 +54,51 @@ const int kMemorySize_256 = 16;
 const int kMemorySize_512 = 8;
 const int kMemorySize_1024 = 8;
 
-const int kDescNum = 16;
+const int kDataSize = 1024 * 21;
+
+const int kInvalidOffset = -1;
+
+const int kMagic = 21354532;
+
+const int kFirstOffset[] = {
+    0,
+    16 * 64,
+    16 * 64 + 128 * 32,
+    16 * 64 + 128 * 32 + 256 * 16,
+    16 * 64 + 128 * 32 + 256 * 16 + 512 * 8};
+const int kLastOffset[] = {
+    kFirstOffset[1] - kClassSize[0],
+    kFirstOffset[2] - kClassSize[1],
+    kFirstOffset[3] - kClassSize[2],
+    kFirstOffset[4] - kClassSize[3],
+    kDataSize - kClassSize[4],
+};
+
+int size_class_for(int size) {
+    for (int i = 0; i < kClassNum; ++i) {
+        if (size <= kClassSize[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+struct MessageDesc {
+    int offset;
+    int len;
+};
+
+struct FreeListHeads {
+    std::atomic<int> offset[kClassNum];
+};
+
+struct FreeListTails {
+    std::atomic<int> offset[kClassNum];
+};
 
 struct Outstanding {
     pthread_mutex_t mutex;
-    bool chunk_16[kMemorySize_16];
+    bool chunk[kClassNum][1024 * kMemorySize_1024];
 };
 
 struct SharedData {
@@ -90,14 +113,13 @@ struct SharedData {
     Outstanding outstanding;
 };
 
-const int kMagic = 21354532;
-
 int expected_seq = 0;
 
 void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
     for (int i = 0; i < n; ++i) {
         int offset = desc_ring[i].offset;
         int len = desc_ring[i].len;
+        int size_class = size_class_for(len);
 
         int idx = 0;
         while (idx < kClassNum && len > kClassSize[idx]) ++idx;
@@ -111,7 +133,7 @@ void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
         memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
         cout << "read " << len << " byte, offset is " << offset << ", seq is " << seq << endl;
         if (magic != kMagic) {
-            cout << "error magic: expected is" << kMagic << ", actual is " << magic << endl;
+            cout << "error magic: expected is " << kMagic << ", actual is " << magic << endl;
             exit(1);
         }
         if (seq != expected_seq) {
@@ -126,22 +148,27 @@ void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
         ++expected_seq;
 
         {
-            pthread_mutex_lock(&p->outstanding.mutex);
-
-            int idx = offset / 16;
-            // cout << "the " << idx << " chunk free" << endl;
-            if (p->outstanding.chunk_16[idx] == false) {
-                cout << "the " << idx << " chunk free twice" << endl;
+            if (offset < kFirstOffset[size_class] || offset > kLastOffset[size_class]) {
+                cout << "size_class " << size_class << " offset is out of range: head_off is " << offset << endl;
                 exit(1);
             }
-            p->outstanding.chunk_16[idx] = false;
+
+            pthread_mutex_lock(&p->outstanding.mutex);
+
+            int idx = offset / kClassSize[size_class];
+            // cout << "the " << idx << " chunk free" << endl;
+            if (p->outstanding.chunk[size_class][idx] == false) {
+                cout << "size_class " << size_class << " the " << idx << " chunk free twice" << endl;
+                exit(1);
+            }
+            p->outstanding.chunk[size_class][idx] = false;
 
             pthread_mutex_unlock(&p->outstanding.mutex);
         }
 
-        int last_tail_off_16 = p->tail.offset_16.load(memory_order_relaxed);
-        memcpy(p->data + last_tail_off_16, &offset, sizeof(int));
-        p->tail.offset_16.store(offset, std::memory_order_release);
+        int last_tail_off = p->tail.offset[size_class].load(memory_order_relaxed);
+        memcpy(p->data + last_tail_off, &offset, sizeof(int));
+        p->tail.offset[size_class].store(offset, std::memory_order_release);
     }
 }
 
@@ -250,9 +277,11 @@ int main() {
     {
         pthread_mutex_lock(&p->outstanding.mutex);
 
-        for (int i = 0; i < kMemorySize_16; ++i) {
-            if (p->outstanding.chunk_16[i] == true) {
-                cout << "the " << i << " chunk not freee" << endl;
+        for (int i = 0; i < kClassNum; ++i) {
+            for (int j = 0; j < kMemorySize_16; ++j) {
+                if (p->outstanding.chunk[i][j] == true) {
+                    cout << "class " << i << " the " << i << " chunk not freee" << endl;
+                }
             }
         }
 
