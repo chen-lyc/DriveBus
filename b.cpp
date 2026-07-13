@@ -1,4 +1,6 @@
 #include "include/logger.h"
+#include "include/shared_memory_layout.hpp"
+#include "include/shared_memory_layout_helpers.hpp"
 #include <atomic>
 #include <cstring>
 #include <iostream>
@@ -14,17 +16,17 @@
 #include <stdint.h>
 using namespace std;
 
-int get_msg_size() {
+uint32_t get_msg_size() {
     random_device rd;
     mt19937 gen(rd());
 
-    const int K = 1;
-    const int M = 1;
+    const uint32_t K = 1;
+    const uint32_t M = 1;
 
-    uniform_int_distribution<int> choose(0, 1);
+    uniform_int_distribution<uint32_t> choose(0, 1);
 
-    uniform_int_distribution<int> small_dist(8 * K, 16 * K);
-    uniform_int_distribution<int> big_dist(128 * M, 1024 * M);
+    uniform_int_distribution<uint32_t> small_dist(8 * K, 16 * K);
+    uniform_int_distribution<uint32_t> big_dist(128 * M, 1024 * M);
 
     if (choose(gen) == 0) {
         return small_dist(gen);
@@ -59,112 +61,40 @@ void send_fd(int sock, int fd) {
     sendmsg(sock, &msg, 0);
 }
 
-const int kDescNum = 16;
-
-const int kClassNum = 5;
-constexpr int kClassSize[] = {16, 128, 256, 512, 1024};
-
-const int kMemorySize[] = {64, 32, 16, 8, 8};
-
-const int kMemorySize_16 = 64;
-const int kMemorySize_128 = 32;
-const int kMemorySize_256 = 16;
-const int kMemorySize_512 = 8;
-const int kMemorySize_1024 = 8;
-
-const int kDataSize = 1024 * 21;
-
-const int kInvalidOffset = -1;
-
-const int kMagic = 21354532;
-
-const int kFirstOffset[] = {
-    0,
-    16 * 64,
-    16 * 64 + 128 * 32,
-    16 * 64 + 128 * 32 + 256 * 16,
-    16 * 64 + 128 * 32 + 256 * 16 + 512 * 8};
-const int kLastOffset[] = {
-    kFirstOffset[1] - kClassSize[0],
-    kFirstOffset[2] - kClassSize[1],
-    kFirstOffset[3] - kClassSize[2],
-    kFirstOffset[4] - kClassSize[3],
-    kDataSize - kClassSize[4],
-};
-
-int size_class_for(int size) {
-    for (int i = 0; i < kClassNum; ++i) {
-        if (size <= kClassSize[i]) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-struct MessageDesc {
-    int offset;
-    int len;
-};
-
-struct FreeListHeads {
-    std::atomic<int> offset[kClassNum];
-};
-
-struct FreeListTails {
-    std::atomic<int> offset[kClassNum];
-};
-
-struct Outstanding {
-    pthread_mutex_t mutex;
-    bool chunk[kClassNum][1024 * kMemorySize_1024];
-};
-
-struct SharedData {
-    atomic<int> offset_read = 0;  // 还未读的第一个偏移量位置
-    atomic<int> offset_write = 0; // 还未写的第一个偏移量位置
-    // 同环次数已写区间 [rd, wr), 单位是描述符个数
-    MessageDesc desc_ring[kDescNum];
-    FreeListHeads head;
-    FreeListTails tail;
-    char data[1024 * 21];
-
-    Outstanding outstanding;
-};
-
-void outstanding_init(Outstanding &outstanding) {
+void outstanding_init(ChunkUsageTracker &outstanding) {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
     pthread_mutex_init(&outstanding.mutex, &attr);
     pthread_mutexattr_destroy(&attr);
 
-    memset(outstanding.chunk, 0, sizeof(outstanding.chunk));
+    memset(outstanding.is_in_use, 0, sizeof(outstanding.is_in_use));
 }
 
 void shm_init(SharedData &shm) {
-    shm.offset_read.store(0, memory_order_relaxed);
-    shm.offset_write.store(0, memory_order_relaxed);
+    shm.descriptor_read_index.store(0, memory_order_relaxed);
+    shm.descriptor_write_index.store(0, memory_order_relaxed);
 
     shm.head.offset[0].store(0, memory_order_relaxed);
-    for (int i = 1; i < kClassNum; ++i) {
-        shm.head.offset[i].store(shm.head.offset[i - 1].load(memory_order_relaxed) + kClassSize[i - 1] * kMemorySize[i - 1], memory_order_relaxed);
+    for (int i = 1; i < kClassCount; ++i) {
+        shm.head.offset[i].store(shm.head.offset[i - 1].load(memory_order_relaxed) + kClassSizeBytes[i - 1] * kBlockCountBySizeClass[i - 1], memory_order_relaxed);
     }
 
-    for (int i = 0; i < kClassNum - 1; ++i) {
-        shm.tail.offset[i].store(shm.head.offset[i + 1].load(memory_order_relaxed) - kClassSize[i], memory_order_relaxed);
+    for (int i = 0; i < kClassCount - 1; ++i) {
+        shm.tail.offset[i].store(shm.head.offset[i + 1].load(memory_order_relaxed) - kClassSizeBytes[i], memory_order_relaxed);
     }
-    shm.tail.offset[kClassNum - 1].store(sizeof(shm.data) - kClassSize[kClassNum - 1], memory_order_relaxed);
+    shm.tail.offset[kClassCount - 1].store(sizeof(shm.data) - kClassSizeBytes[kClassCount - 1], memory_order_relaxed);
 
-    auto init = [&](int size, const int kMemorySize, int offset) {
-        for (int i = 0; i < kMemorySize - 1; ++i) {
-            int next_offset = offset + size;
-            memcpy(shm.data + offset, &next_offset, sizeof(int));
+    auto init = [&](uint32_t block_size_bytes, const uint32_t block_count, uint32_t offset) {
+        for (uint32_t i = 0; i < block_count - 1; ++i) {
+            uint32_t next_offset = offset + block_size_bytes;
+            memcpy(shm.data + offset, &next_offset, sizeof(uint32_t));
             offset = next_offset;
         }
-        memcpy(shm.data + offset, &kInvalidOffset, sizeof(int));
+        memcpy(shm.data + offset, &kInvalidOffset, sizeof(uint32_t));
     };
-    for (int i = 0; i < kClassNum; ++i) {
-        init(kClassSize[i], kMemorySize[i], shm.head.offset[i]);
+    for (int i = 0; i < kClassCount; ++i) {
+        init(kClassSizeBytes[i], kBlockCountBySizeClass[i], shm.head.offset[i]);
     }
 }
 
@@ -175,7 +105,7 @@ int main() {
     SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
 
     shm_init(*p);
-    outstanding_init(p->outstanding);
+    outstanding_init(p->chunk_usage_tracker);
 
     const string path = "/tmp/demo.sock";
 
@@ -200,39 +130,26 @@ int main() {
     int task_num = 26 * 3000;
     int seq = 0;
     for (char c = 'a'; task_num; ++c) {
-        int len = get_msg_size();
-        int size_class = size_class_for(len);
-        if (size_class == -1) {
-            cout << "seq is " << seq << " size is " << len << ": size is too big" << endl;
+        uint32_t message_size_bytes = get_msg_size();
+        int size_class = find_size_class(message_size_bytes);
+        if (size_class < 0) {
+            cout << "seq is " << seq << " size is " << message_size_bytes << ": size is too big" << endl;
             return 1;
         }
 
-        int rd = p->offset_read.load(std::memory_order_acquire);
-        int wr = p->offset_write.load(memory_order_relaxed);
-        while ((rd > wr && rd <= wr + 1) || wr + 1 >= rd + kDescNum) {
+        uint32_t rd = p->descriptor_read_index.load(std::memory_order_acquire);
+        uint32_t wr = p->descriptor_write_index.load(memory_order_relaxed);
+        while ((rd > wr && rd <= wr + 1) || wr + 1 >= rd + kDescriptorSlotCount) {
             this_thread::sleep_for(chrono::milliseconds(1));
-            rd = p->offset_read.load(std::memory_order_acquire);
-            wr = p->offset_write.load(memory_order_relaxed);
+            rd = p->descriptor_read_index.load(std::memory_order_acquire);
+            wr = p->descriptor_write_index.load(memory_order_relaxed);
         }
 
-        int head_off = p->head.offset[size_class].load(memory_order_relaxed);
-        int tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
+        uint32_t head_off = p->head.offset[size_class].load(memory_order_relaxed);
+        uint32_t tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
         while (head_off == tail_off) {
             this_thread::sleep_for(chrono::milliseconds(1));
             tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
-        }
-        int next_head_off;
-        memcpy(&next_head_off, p->data + head_off, sizeof(int));
-        p->head.offset[size_class].store(next_head_off, memory_order_relaxed);
-
-        MessageDesc desc{head_off, len};
-        memcpy(p->desc_ring + wr, &desc, sizeof(MessageDesc));
-
-        memcpy(p->data + head_off, &kMagic, sizeof(int));
-        memcpy(p->data + head_off + sizeof(int), &seq, sizeof(int));
-        ++seq;
-        if (len > 2 * sizeof(int)) {
-            memset(p->data + head_off + 2 * sizeof(int), c, len - 2 * sizeof(int));
         }
 
         {
@@ -241,28 +158,42 @@ int main() {
                 return -1;
             }
 
-            pthread_mutex_lock(&p->outstanding.mutex);
+            pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
-            int idx = head_off / kClassSize[size_class];
-            if (p->outstanding.chunk[size_class][idx] == true) {
-                cout << "size_class " << size_class << " the " << idx << " chunk error use again" << endl;
-                pthread_mutex_unlock(&p->outstanding.mutex);
+            size_t block_index = head_off / kClassSizeBytes[size_class];
+            if (p->chunk_usage_tracker.is_in_use[size_class][block_index] == true) {
+                cout << "size_class " << size_class << " the " << block_index << " chunk error use again" << endl;
+                pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
                 return 1;
             } else {
                 // cout << "size_class " << size_class <<"the " << idx << " chunk using" << endl;
-                p->outstanding.chunk[size_class][idx] = true;
+                p->chunk_usage_tracker.is_in_use[size_class][block_index] = true;
             }
 
-            pthread_mutex_unlock(&p->outstanding.mutex);
+            pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
         }
 
-        int candidate = wr + 1;
-        if (candidate >= kDescNum) p->offset_write.store(candidate % kDescNum, std::memory_order_release);
-        else p->offset_write.store(candidate, std::memory_order_release);
+        uint32_t next_head_off;
+        memcpy(&next_head_off, p->data + head_off, sizeof(uint32_t));
+        p->head.offset[size_class].store(next_head_off, memory_order_relaxed);
+
+        MessageDescriptor desc{head_off, message_size_bytes};
+        memcpy(p->desc_ring + wr, &desc, sizeof(MessageDescriptor));
+
+        memcpy(p->data + head_off, &kMagic, sizeof(int));
+        memcpy(p->data + head_off + sizeof(int), &seq, sizeof(int));
+        ++seq;
+        if (message_size_bytes > 2 * sizeof(int)) {
+            memset(p->data + head_off + 2 * sizeof(int), c, message_size_bytes - 2 * sizeof(int));
+        }
+
+        uint32_t candidate = wr + 1;
+        if (candidate >= kDescriptorSlotCount) p->descriptor_write_index.store(candidate % kDescriptorSlotCount, std::memory_order_release);
+        else p->descriptor_write_index.store(candidate, std::memory_order_release);
 
         uint64_t val = 1;
         write(efd, &val, sizeof(val));
-        cout << "write " << len << " byte " << c << endl;
+        cout << "write " << message_size_bytes << " byte " << c << endl;
         --task_num;
         if (c == 'z') c = 'a' - 1;
     }
