@@ -14,6 +14,7 @@
 | 6 | [06-local-variables-and-while-vs-if.md](06-local-variables-and-while-vs-if.md) | 局部变量固定值（正确性前提）+ while vs if 选择 |
 | 7 | [07-unix-socket-shm-foundation.md](07-unix-socket-shm-foundation.md) | 📖 Linux IPC 语法基础：共享内存、Unix Socket、sendmsg/recvmsg 结构体体系 |
 | 8 | [08-pthread-mutex-in-shm.md](08-pthread-mutex-in-shm.md) | 共享内存中嵌入 pthread_mutex_t：PTHREAD_PROCESS_SHARED、API 流程、与 atomic 的配合 |
+| 9 | [09-type-boundaries-and-naming.md](09-type-boundaries-and-naming.md) | 共享布局、本地对象范围、接口类型与变量命名 |
 
 ## 技术栈
 
