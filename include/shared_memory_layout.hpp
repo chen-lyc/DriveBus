@@ -6,17 +6,23 @@
 #include <pthread.h>
 
 inline constexpr uint32_t kDescriptorSlotCount = 16;
+inline constexpr size_t kMaxSubscribers = 2;
+inline constexpr uint32_t kInvalidIndex = std::numeric_limits<uint32_t>::max();
 
 inline constexpr int kClassCount = 5;
 inline constexpr uint32_t kClassSizeBytes[] = {16, 128, 256, 512, 1024};
 
-inline constexpr uint32_t kBlockCountBySizeClass[] = {64, 32, 16, 8, 8};
+inline constexpr uint32_t kChunkCountBySizeClass[] = {64, 32, 16, 8, 8};
+inline constexpr uint32_t kTotalChunkCount =
+    kChunkCountBySizeClass[0] +
+    kChunkCountBySizeClass[1] +
+    kChunkCountBySizeClass[2] +
+    kChunkCountBySizeClass[3] +
+    kChunkCountBySizeClass[4];
 
-inline constexpr int kBlockCountBySizeClass_16 = 64;
-inline constexpr int kBlockCountBySizeClass_128 = 32;
-inline constexpr int kBlockCountBySizeClass_256 = 16;
-inline constexpr int kBlockCountBySizeClass_512 = 8;
-inline constexpr int kBlockCountBySizeClass_1024 = 8;
+inline constexpr uint32_t kChunkIndexBaseBySizeClass[] = {0, 64, 96, 112, 120};
+
+inline constexpr int kMaxChunkCountPerSizeClass = 64;
 
 inline constexpr int kPayloadPoolSizeBytes = 1024 * 21;
 
@@ -53,16 +59,17 @@ struct FreeListTails {
 
 struct ChunkUsageTracker {
     pthread_mutex_t mutex;
-    bool is_in_use[kClassCount][kBlockCountBySizeClass_16];
+    bool is_in_use[kClassCount][kMaxChunkCountPerSizeClass];
 };
 
 struct SharedData {
-    std::atomic<uint32_t> descriptor_read_index = 0;  // 还未读的第一个偏移量位置
-    std::atomic<uint32_t> descriptor_write_index = 0; // 还未写的第一个偏移量位置
+    std::atomic<uint32_t> descriptor_read_indexs[kMaxSubscribers]{}; // 还未读的第一个偏移量位置
+    std::atomic<uint32_t> descriptor_write_index = 0;                // 还未写的第一个偏移量位置
     // 同环次数已写区间 [rd, wr), 单位是描述符个数
     MessageDescriptor desc_ring[kDescriptorSlotCount];
     FreeListHeads head;
     FreeListTails tail;
+    std::atomic<uint8_t> chunk_reference_counts[kTotalChunkCount]{};
     char data[1024 * 21];
 
     ChunkUsageTracker chunk_usage_tracker;

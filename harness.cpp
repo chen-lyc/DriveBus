@@ -26,7 +26,7 @@ int get_msg_size() {
     }
 }
 
-struct MessageDesc {
+struct MessageDescriptor {
     int offset;
     int len;
 };
@@ -53,7 +53,7 @@ struct SharedData {
     atomic<int> offset_read = 0;  // 还未读的第一个偏移量位置
     atomic<int> offset_write = 0; // 还未写的第一个偏移量位置
     // 同环次数已写区间 [rd, wr), 单位是描述符个数
-    MessageDesc desc_ring[kDescNum];
+    MessageDescriptor desc_ring[kDescNum];
     FreeListHeads head;
     FreeListTails tail;
     char data[1024 * 21];
@@ -72,7 +72,7 @@ const int kInvalidOffset = -1;
 
 const int kMagic = 21354532;
 
-void read_data(SharedData *p, MessageDesc desc_ring[], int n) {
+void read_data(SharedData *p, MessageDescriptor desc_ring[], int n) {
     for (int i = 0; i < n; i++) {
         int offset = desc_ring[i].offset;
         int len = desc_ring[i].len;
@@ -140,7 +140,7 @@ void run_a(SharedData *p) {
 
         if (rd > wr) {
             int num = kDescNum - rd;
-            MessageDesc desc_ring[num];
+            MessageDescriptor desc_ring[num];
             copy(p->desc_ring + rd, p->desc_ring + kDescNum, desc_ring);
             read_data(p, desc_ring, num);
             consumed += num;
@@ -152,7 +152,7 @@ void run_a(SharedData *p) {
         rd = p->offset_read.load(memory_order_relaxed);
         if (wr > rd) {
             int num = wr - rd;
-            MessageDesc desc_ring[num];
+            MessageDescriptor desc_ring[num];
             copy(p->desc_ring + rd, p->desc_ring + wr, desc_ring);
             read_data(p, desc_ring, num);
             consumed += num;
@@ -191,8 +191,8 @@ void run_b(SharedData *p) {
         memcpy(&next_head_off_16, p->data + head_off_16, sizeof(int));
         p->head.offset_16.store(next_head_off_16, memory_order_relaxed);
 
-        MessageDesc desc{head_off_16, len};
-        memcpy(p->desc_ring + wr, &desc, sizeof(MessageDesc));
+        MessageDescriptor desc{head_off_16, len};
+        memcpy(p->desc_ring + wr, &desc, sizeof(MessageDescriptor));
 
         memcpy(p->data + head_off_16, &kMagic, sizeof(int));
         memcpy(p->data + head_off_16 + sizeof(int), &seq, sizeof(int));

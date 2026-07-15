@@ -46,6 +46,9 @@ int recv_fd(int sock) {
 
 int expected_seq = 0;
 
+uint32_t subscriber_read_index = 0;
+size_t subscriber_slot_index;
+
 void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descriptor_count) {
     for (size_t descriptor_index = 0; descriptor_index < descriptor_count; ++descriptor_index) {
         uint32_t offset = desc_ring[descriptor_index].offset;
@@ -82,45 +85,67 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
                 exit(1);
             }
 
-            pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
+            // pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
-            size_t block_index = offset / kClassSizeBytes[size_class];
-            // cout << "the " << idx << " chunk free" << endl;
-            if (p->chunk_usage_tracker.is_in_use[size_class][block_index] == false) {
-                cout << "size_class " << size_class << " the " << block_index << " chunk free twice" << endl;
-                exit(1);
-            }
-            p->chunk_usage_tracker.is_in_use[size_class][block_index] = false;
+            // size_t chunk_index = offset / kClassSizeBytes[size_class];
+            // // cout << "the " << idx << " chunk free" << endl;
+            // if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == false) {
+            //     cout << "size_class " << size_class << " the " << chunk_index << " chunk free twice" << endl;
+            //     exit(1);
+            // }
+            // p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = false;
 
-            pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+            // pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
         }
 
-        uint32_t last_tail_off = p->tail.offset[size_class].load(memory_order_relaxed);
-        memcpy(p->data + last_tail_off, &offset, sizeof(uint32_t));
-        p->tail.offset[size_class].store(offset, std::memory_order_release);
+        uint32_t local_chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
+        uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
+        uint8_t previous_reference_count = p->chunk_reference_counts[chunk_index].fetch_sub(1, std::memory_order_acq_rel);
+
+        cout << "subscriber_read_index is " << subscriber_read_index << endl;
+
+        if (previous_reference_count == 1) {
+            uint32_t last_tail_off = p->tail.offset[size_class].load(memory_order_relaxed);
+            memcpy(p->data + last_tail_off, &offset, sizeof(uint32_t));
+            p->tail.offset[size_class].store(offset, std::memory_order_release);
+        }
+    }
+}
+
+void consume_contiguous_messages(SharedData *p) {
+    uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
+    while (wr > subscriber_read_index) {
+        const size_t descriptor_count = static_cast<size_t>(wr - subscriber_read_index);
+        MessageDescriptor desc_ring[descriptor_count];
+        copy(p->desc_ring + subscriber_read_index, p->desc_ring + wr, desc_ring);
+
+        subscriber_read_index = wr;
+        p->descriptor_read_indexs[subscriber_slot_index].store(wr, std::memory_order_release);
+        wr = p->descriptor_write_index.load(std::memory_order_acquire);
+
+        read_data(p, desc_ring, descriptor_count);
     }
 }
 
 int main() {
     const string path = "/tmp/demo.sock";
-    unlink(path.c_str());
 
-    int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path.c_str());
 
-    int ret = bind(listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    int ret = connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    int fail_num = 0;
+    while (ret < 0 && fail_num < 3) {
+        sleep(1);
+        ++fail_num;
+        ret = connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    }
     if (ret < 0) return -1;
 
-    ret = listen(listen_fd, 1);
-    if (ret < 0) return -1;
-
-    cout << "receiver listening...\n";
-
-    int conn_fd = accept(listen_fd, nullptr, nullptr);
-
-    int efd = recv_fd(conn_fd);
+    int efd = recv_fd(sock);
 
     int epollfd = epoll_create1(0);
     epoll_event event;
@@ -136,22 +161,19 @@ int main() {
     }
     SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
 
+    for (int subscriber_index = 0; subscriber_index < kMaxSubscribers; ++subscriber_index) {
+        uint32_t expected = kInvalidIndex;
+        if (p->descriptor_read_indexs[subscriber_index].compare_exchange_strong(expected, 0)) {
+            subscriber_slot_index = subscriber_index;
+            cout << "subscriber_slot_index is " << subscriber_slot_index << endl;
+            break;
+        }
+    }
+
     uint64_t val;
     ssize_t n = read(efd, &val, sizeof(val));
     if (n > 0) {
-        uint32_t rd = p->descriptor_read_index.load(memory_order_relaxed);
-        uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
-        while (wr > rd) {
-            const size_t descriptor_count = static_cast<size_t>(wr - rd);
-            MessageDescriptor desc_ring[descriptor_count];
-            copy(p->desc_ring + rd, p->desc_ring + wr, desc_ring);
-
-            rd = wr;
-            p->descriptor_read_index.store(wr, std::memory_order_release);
-            wr = p->descriptor_write_index.load(std::memory_order_acquire);
-
-            read_data(p, desc_ring, descriptor_count);
-        }
+        consume_contiguous_messages(p);
         cout << "read over" << endl;
     }
     // 防止 b 进程在 epoll_wait 之前触发时间，导致 ET 模式无法收到
@@ -172,47 +194,36 @@ int main() {
                 uint64_t val;
                 read(efd, &val, sizeof(val));
 
-                uint32_t rd = p->descriptor_read_index.load(memory_order_relaxed);
                 uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
-                if (rd > wr) {
-                    const size_t descriptor_count = static_cast<size_t>(kDescriptorSlotCount - rd);
+                if (subscriber_read_index > wr) {
+                    const size_t descriptor_count = static_cast<size_t>(kDescriptorSlotCount - subscriber_read_index);
                     MessageDescriptor desc_ring[descriptor_count];
-                    copy(p->desc_ring + rd, p->desc_ring + kDescriptorSlotCount, desc_ring);
+                    copy(p->desc_ring + subscriber_read_index, p->desc_ring + kDescriptorSlotCount, desc_ring);
 
-                    p->descriptor_read_index.store(0, std::memory_order_release);
-
-                    read_data(p, desc_ring, descriptor_count);
-                }
-
-                wr = p->descriptor_write_index.load(std::memory_order_acquire);
-                rd = p->descriptor_read_index.load(memory_order_relaxed);
-                while (wr > rd) {
-                    const size_t descriptor_count = static_cast<size_t>(wr - rd);
-                    MessageDescriptor desc_ring[descriptor_count];
-                    copy(p->desc_ring + rd, p->desc_ring + wr, desc_ring);
-
-                    rd = wr;
-                    p->descriptor_read_index.store(wr, std::memory_order_release);
+                    subscriber_read_index = 0;
+                    p->descriptor_read_indexs[subscriber_slot_index].store(0, std::memory_order_release);
                     wr = p->descriptor_write_index.load(std::memory_order_acquire);
 
                     read_data(p, desc_ring, descriptor_count);
                 }
+
+                consume_contiguous_messages(p);
                 cout << "read over" << endl;
             }
         }
         this_thread::sleep_for(chrono::milliseconds(1));
     }
 
-    write(1, p->data, sizeof(p->data));
-    cout << endl;
+    // write(1, p->data, sizeof(p->data));
+    // cout << endl;
 
     {
         pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
         for (int i = 0; i < kClassCount; ++i) {
-            for (int j = 0; j < kBlockCountBySizeClass_16; ++j) {
+            for (int j = 0; j < kChunkCountBySizeClass[i]; ++j) {
                 if (p->chunk_usage_tracker.is_in_use[i][j] == true) {
-                    cout << "class " << i << " the " << i << " chunk not freee" << endl;
+                    cout << "class " << i << " the " << j << " chunk not free" << endl;
                 }
             }
         }
