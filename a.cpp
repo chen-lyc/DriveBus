@@ -79,24 +79,13 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
 
         ++expected_seq;
 
-        {
-            if (offset < kFirstOffset[size_class] || offset > kLastOffset[size_class]) {
-                cout << "size_class " << size_class << " offset is out of range: head_off is " << offset << endl;
-                exit(1);
-            }
-
-            // pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
-
-            // size_t chunk_index = offset / kClassSizeBytes[size_class];
-            // // cout << "the " << idx << " chunk free" << endl;
-            // if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == false) {
-            //     cout << "size_class " << size_class << " the " << chunk_index << " chunk free twice" << endl;
-            //     exit(1);
-            // }
-            // p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = false;
-
-            // pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+#ifdef ENABLE_DEBUG_CHECKS
+        if (offset < kFirstOffset[size_class] || offset > kLastOffset[size_class]) {
+            cout << "size_class " << size_class << " offset is out of range: head_off is " << offset << endl;
+            pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+            exit(1);
         }
+#endif
 
         uint32_t local_chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
         uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
@@ -105,6 +94,23 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
         cout << "subscriber_read_index is " << subscriber_read_index << endl;
 
         if (previous_reference_count == 1) {
+#ifdef ENABLE_DEBUG_CHECKS
+            {
+                pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
+
+                size_t chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
+                cout << "the " << chunk_index << " chunk free" << endl;
+                if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == false) {
+                    cout << "size_class " << size_class << " the " << chunk_index << " chunk free twice" << endl;
+                    pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+                    exit(1);
+                }
+                p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = false;
+
+                pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+            }
+#endif
+
             uint32_t last_tail_off = p->tail.offset[size_class].load(memory_order_relaxed);
             memcpy(p->data + last_tail_off, &offset, sizeof(uint32_t));
             p->tail.offset[size_class].store(offset, std::memory_order_release);
@@ -217,11 +223,12 @@ int main() {
     // write(1, p->data, sizeof(p->data));
     // cout << endl;
 
+#ifdef ENABLE_DEBUG_CHECKS
     {
         pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
         for (int i = 0; i < kClassCount; ++i) {
-            for (int j = 0; j < kChunkCountBySizeClass[i]; ++j) {
+            for (int j = 0; j < kMaxChunkCountPerSizeClass; ++j) {
                 if (p->chunk_usage_tracker.is_in_use[i][j] == true) {
                     cout << "class " << i << " the " << j << " chunk not free" << endl;
                 }
@@ -229,8 +236,9 @@ int main() {
         }
 
         pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+        pthread_mutex_destroy(&p->chunk_usage_tracker.mutex);
     }
-    pthread_mutex_destroy(&p->chunk_usage_tracker.mutex);
+#endif
 
     munmap(p, sizeof(SharedData));
     shm_unlink("/shm");

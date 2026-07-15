@@ -133,7 +133,9 @@ int main() {
     SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
 
     shm_init(*p);
+#ifdef ENABLE_DEBUG_CHECKS
     Chunk_usage_tracker_init(p->chunk_usage_tracker);
+#endif
 
     const string path = "/tmp/demo.sock";
     unlink(path.c_str());
@@ -189,26 +191,28 @@ int main() {
             tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
         }
 
+#ifdef ENABLE_DEBUG_CHECKS
         {
             if (head_off < kFirstOffset[size_class] || head_off > kLastOffset[size_class]) {
                 cout << "size_class " << size_class << " offset is out of range: head_off is " << head_off << endl;
                 return -1;
             }
 
-            // pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
+            pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
-            // size_t chunk_index = head_off / kClassSizeBytes[size_class];
-            // if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == true) {
-            //     cout << "size_class " << size_class << " the " << chunk_index << " chunk error use again" << endl;
-            //     pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
-            //     return 1;
-            // } else {
-            //     // cout << "size_class " << size_class <<"the " << idx << " chunk using" << endl;
-            //     p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = true;
-            // }
+            size_t chunk_index = (head_off - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
+            if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == true) {
+                cout << "size_class " << size_class << " the " << chunk_index << " chunk error use again" << endl;
+                pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+                return 1;
+            } else {
+                // cout << "size_class " << size_class <<"the " << idx << " chunk using" << endl;
+                p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = true;
+            }
 
-            // pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
+            pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
         }
+#endif
 
         uint32_t next_head_off;
         memcpy(&next_head_off, p->data + head_off, sizeof(uint32_t));

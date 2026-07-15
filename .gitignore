@@ -18,6 +18,7 @@ logs/
 .vscode/
 .codex
 .clang-format
+.clangd
 
 # 临时截图
 *.png

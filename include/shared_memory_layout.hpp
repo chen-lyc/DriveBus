@@ -72,5 +72,7 @@ struct SharedData {
     std::atomic<uint8_t> chunk_reference_counts[kTotalChunkCount]{};
     char data[1024 * 21];
 
+#ifdef ENABLE_DEBUG_CHECKS
     ChunkUsageTracker chunk_usage_tracker;
+#endif
 };
