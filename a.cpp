@@ -16,13 +16,18 @@
 #include <stdint.h>
 using namespace std;
 
+int expected_seq = 0;
+
+uint32_t subscriber_read_index = 0;
+size_t subscriber_slot_index;
+
 int recv_fd(int sock) {
     struct msghdr msg{};
 
-    char dummy;
+    uint32_t recvived_subscriber_slot_index;
     struct iovec iov;
-    iov.iov_base = &dummy;
-    iov.iov_len = sizeof(dummy);
+    iov.iov_base = &recvived_subscriber_slot_index;
+    iov.iov_len = sizeof(recvived_subscriber_slot_index);
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -41,13 +46,9 @@ int recv_fd(int sock) {
     if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return -1;
 
     int fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    subscriber_slot_index = recvived_subscriber_slot_index;
     return fd;
 }
-
-int expected_seq = 0;
-
-uint32_t subscriber_read_index = 0;
-size_t subscriber_slot_index;
 
 void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descriptor_count) {
     for (size_t descriptor_index = 0; descriptor_index < descriptor_count; ++descriptor_index) {
@@ -89,11 +90,14 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
 
         uint32_t local_chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
         uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
-        uint8_t previous_reference_count = p->chunk_reference_counts[chunk_index].fetch_sub(1, std::memory_order_acq_rel);
+        uint8_t subscriber_reference_bit = 1 << subscriber_slot_index;
+        uint8_t previous_reference_count = p->chunk_reference_counts[chunk_index].fetch_and(~subscriber_reference_bit, std::memory_order_acq_rel);
 
+        if (++subscriber_read_index >= kDescriptorSlotCount) subscriber_read_index %= kDescriptorSlotCount;
+        p->descriptor_read_indices[subscriber_slot_index].store(subscriber_read_index, std::memory_order_release);
         cout << "subscriber_read_index is " << subscriber_read_index << endl;
 
-        if (previous_reference_count == 1) {
+        if (previous_reference_count == subscriber_reference_bit) {
 #ifdef ENABLE_DEBUG_CHECKS
             {
                 pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
@@ -125,11 +129,8 @@ void consume_contiguous_messages(SharedData *p) {
         MessageDescriptor desc_ring[descriptor_count];
         copy(p->desc_ring + subscriber_read_index, p->desc_ring + wr, desc_ring);
 
-        subscriber_read_index = wr;
-        p->descriptor_read_indexs[subscriber_slot_index].store(wr, std::memory_order_release);
-        wr = p->descriptor_write_index.load(std::memory_order_acquire);
-
         read_data(p, desc_ring, descriptor_count);
+        wr = p->descriptor_write_index.load(std::memory_order_acquire);
     }
 }
 
@@ -166,15 +167,7 @@ int main() {
         return 1;
     }
     SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-
-    for (int subscriber_index = 0; subscriber_index < kMaxSubscribers; ++subscriber_index) {
-        uint32_t expected = kInvalidIndex;
-        if (p->descriptor_read_indexs[subscriber_index].compare_exchange_strong(expected, 0)) {
-            subscriber_slot_index = subscriber_index;
-            cout << "subscriber_slot_index is " << subscriber_slot_index << endl;
-            break;
-        }
-    }
+    p->descriptor_read_indices[subscriber_slot_index].store(0, memory_order_relaxed);
 
     uint64_t val;
     ssize_t n = read(efd, &val, sizeof(val));
@@ -201,16 +194,14 @@ int main() {
                 read(efd, &val, sizeof(val));
 
                 uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
+                cout << "wr is " << wr << ", rd is " << subscriber_read_index << endl;
                 if (subscriber_read_index > wr) {
                     const size_t descriptor_count = static_cast<size_t>(kDescriptorSlotCount - subscriber_read_index);
                     MessageDescriptor desc_ring[descriptor_count];
                     copy(p->desc_ring + subscriber_read_index, p->desc_ring + kDescriptorSlotCount, desc_ring);
 
-                    subscriber_read_index = 0;
-                    p->descriptor_read_indexs[subscriber_slot_index].store(0, std::memory_order_release);
-                    wr = p->descriptor_write_index.load(std::memory_order_acquire);
-
                     read_data(p, desc_ring, descriptor_count);
+                    wr = p->descriptor_write_index.load(std::memory_order_acquire);
                 }
 
                 consume_contiguous_messages(p);

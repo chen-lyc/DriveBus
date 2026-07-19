@@ -63,8 +63,8 @@ struct ChunkUsageTracker {
 };
 
 struct SharedData {
-    std::atomic<uint32_t> descriptor_read_indexs[kMaxSubscribers]{}; // 还未读的第一个偏移量位置
-    std::atomic<uint32_t> descriptor_write_index = 0;                // 还未写的第一个偏移量位置
+    std::atomic<uint32_t> descriptor_read_indices[kMaxSubscribers]{}; // 还未读的第一个偏移量位置
+    std::atomic<uint32_t> descriptor_write_index = 0;                 // 还未写的第一个偏移量位置
     // 同环次数已写区间 [rd, wr), 单位是描述符个数
     MessageDescriptor desc_ring[kDescriptorSlotCount];
     FreeListHeads head;
