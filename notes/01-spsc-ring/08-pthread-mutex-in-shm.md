@@ -214,3 +214,7 @@ outstanding_init(local.outstanding);  // 初始化的是栈上的 mutex，跟共
 ```
 
 `pthread_mutex_init` 在**传入的地址**上构造锁。如果传的是栈变量的地址，那么锁就只在当前进程的栈上，其他进程访问共享内存里对应位置的 mutex 时看到的是未初始化的字节。
+
+---
+
+> **一句口诀**：`PTHREAD_PROCESS_SHARED` 是让锁跨进程可见的唯一保证；mutex 必须在 `mmap` 区域内原地构造；`destroy` 是释放内核 futex，不能省略。

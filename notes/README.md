@@ -5,4 +5,4 @@
 | 目录 | 主题 |
 |------|------|
 | [01-spsc-ring/](01-spsc-ring/) | 跨进程无锁 SPSC 环：共享内存 + eventfd + epoll |
-| [02-bugs/](02-bugs/) | Bug 定位记录：根因分析 + 定位经验；[数量关系是证据](02-bugs/02-debugging-numeric-patterns.md)、[魔数被 free list 覆盖](02-bugs/03-magic-overwritten-by-free-list.md) |
+| [02-bugs/](02-bugs/) | Bug 定位记录：根因分析 + 定位经验；[数量关系是证据](02-bugs/02-debugging-numeric-patterns.md)、[并发读写 Bug 的证据链](02-bugs/04-debugging-concurrent-bugs.md)、[魔数被 free list 覆盖](02-bugs/03-magic-overwritten-by-free-list.md) |
