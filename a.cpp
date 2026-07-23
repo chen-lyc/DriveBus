@@ -1,10 +1,12 @@
-#include "include/logger.h"
+#include "include/broker_protocol.hpp"
 #include "include/shared_memory_layout.hpp"
 #include "include/shared_memory_layout_helpers.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstddef>
 #include <iostream>
+#include <optional>
+#include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -21,13 +23,18 @@ int expected_seq = 0;
 uint32_t subscriber_read_index = 0;
 size_t subscriber_slot_index;
 
-int recv_fd(int sock) {
+struct SubscriberRegistration {
+    int event_fd;
+    uint32_t slot_index;
+};
+
+optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) {
     struct msghdr msg{};
 
-    uint32_t recvived_subscriber_slot_index;
-    struct iovec iov;
-    iov.iov_base = &recvived_subscriber_slot_index;
-    iov.iov_len = sizeof(recvived_subscriber_slot_index);
+    uint32_t received_subscriber_slot_index;
+    struct iovec iov{};
+    iov.iov_base = &received_subscriber_slot_index;
+    iov.iov_len = sizeof(received_subscriber_slot_index);
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -38,16 +45,15 @@ int recv_fd(int sock) {
     msg.msg_control = control;
     msg.msg_controllen = sizeof(control);
 
-    ssize_t ret = recvmsg(sock, &msg, 0);
-    if (ret < 0) return -1;
+    ssize_t ret = recvmsg(broker_fd, &msg, 0);
+    if (ret < 0) return nullopt;
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg == nullptr) return -1;
-    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+    if (cmsg == nullptr) return nullopt;
+    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return nullopt;
 
     int fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
-    subscriber_slot_index = recvived_subscriber_slot_index;
-    return fd;
+    return SubscriberRegistration{fd, received_subscriber_slot_index};
 }
 
 void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descriptor_count) {
@@ -65,14 +71,16 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
         memcpy(&magic, p->data + offset, sizeof(int));
         memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
         cout << "read " << message_size_bytes << " byte, offset is " << offset << ", seq is " << seq << endl;
+        bool is_error = false;
         if (magic != kMagic) {
             cout << "error magic: expected is " << kMagic << ", actual is " << magic << endl;
-            exit(1);
+            is_error = true;
         }
         if (seq != expected_seq) {
             cout << "error seq: " << " expected is " << expected_seq << ", actual is " << seq << endl;
-            exit(1);
+            is_error = true;
         }
+        if (is_error) exit(1);
         if (message_size_bytes > 2 * sizeof(int)) {
             write(1, p->data + offset + 2 * sizeof(int), message_size_bytes - 2 * sizeof(int));
         }
@@ -135,9 +143,9 @@ void consume_contiguous_messages(SharedData *p) {
 }
 
 int main() {
-    const string path = "/tmp/demo.sock";
+    const string path = "/tmp/broker.sock";
 
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    int sock = socket(AF_UNIX, SOCK_SEQPACKET, 0);
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -152,7 +160,19 @@ int main() {
     }
     if (ret < 0) return -1;
 
-    int efd = recv_fd(sock);
+    BrokerMessageType role = BrokerMessageType::SubscriberRegistration;
+    {
+        ssize_t n = send(sock, &role, sizeof(role), 0);
+        cout << "n = " << n << endl;
+    }
+
+    auto registration = receive_subscriber_registration(sock);
+    if (!registration) {
+        return 1;
+    }
+    int efd = registration->event_fd;
+    subscriber_slot_index = registration->slot_index;
+    cout << "subscriber_slot_index is " << subscriber_slot_index << endl;
 
     int epollfd = epoll_create1(0);
     epoll_event event;
@@ -180,7 +200,7 @@ int main() {
     int maxevents = 1024;
     epoll_event events[maxevents];
     while (true) {
-        int event_count = epoll_wait(epollfd, events, maxevents, 1000);
+        int event_count = epoll_wait(epollfd, events, maxevents, 3000);
         cout << "event_cout = " << event_count << endl;
         if (event_count == 0) {
             cout << "time out" << endl;
@@ -232,7 +252,6 @@ int main() {
 #endif
 
     munmap(p, sizeof(SharedData));
-    shm_unlink("/shm");
     close(fd);
 
     return 0;

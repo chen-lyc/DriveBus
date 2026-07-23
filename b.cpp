@@ -1,11 +1,16 @@
-#include "include/logger.h"
+#include "include/broker_protocol.hpp"
 #include "include/shared_memory_layout.hpp"
 #include "include/shared_memory_layout_helpers.hpp"
+#include "include/fd_helpers.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <random>
+#include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -37,12 +42,18 @@ uint32_t get_msg_size() {
     }
 }
 
-void send_fd(int sock, int fd, uint32_t send_subscriber_slot_index) {
+struct SubscriberRegistration {
+    int event_fd;
+    uint32_t slot_index;
+};
+
+optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) {
     struct msghdr msg{};
 
-    struct iovec iov;
-    iov.iov_base = &send_subscriber_slot_index;
-    iov.iov_len = sizeof(send_subscriber_slot_index);
+    uint32_t received_subscriber_slot_index;
+    struct iovec iov{};
+    iov.iov_base = &received_subscriber_slot_index;
+    iov.iov_len = sizeof(received_subscriber_slot_index);
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -53,36 +64,89 @@ void send_fd(int sock, int fd, uint32_t send_subscriber_slot_index) {
     msg.msg_control = control;
     msg.msg_controllen = sizeof(control);
 
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    ssize_t ret = recvmsg(broker_fd, &msg, 0);
+    if (ret < 0) {
+        cerr << "[b] Failed to receive subscriber registration: recvmsg: " << strerror(errno) << endl;
+        return nullopt;
+    }
 
-    *reinterpret_cast<int *>(CMSG_DATA(cmsg)) = fd;
-    sendmsg(sock, &msg, 0);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == nullptr) {
+        cerr << "[b] Failed to receive subscriber registration: no SCM_RIGHTS file descriptor in message" << endl;
+        return nullopt;
+    }
+    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+        cerr << "[b] Failed to receive subscriber registration: ancillary message is not SCM_RIGHTS" << endl;
+        return nullopt;
+    }
+
+    int fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    return SubscriberRegistration{fd, received_subscriber_slot_index};
 }
 
-bool is_peer_alive(int conn_fd) {
-    char byte;
+vector<int> event_fds{};
+
+constexpr size_t kMaxEvents = 1024;
+
+uint32_t find_slowest_read_index(const SharedData *p) {
+    uint32_t min_read_index_before_write = kInvalidIndex;
+    uint32_t min_read_index_after_write = kInvalidIndex;
+    uint32_t descriptor_write_index = p->descriptor_write_index.load(memory_order_relaxed);
+    for (size_t subsrciber_index = 0; subsrciber_index < kMaxSubscribers; ++subsrciber_index) {
+        uint32_t descriptor_read_index = p->descriptor_read_indices[subsrciber_index].load(std::memory_order_acquire);
+        if (descriptor_read_index == kInvalidIndex) continue;
+
+        if (descriptor_read_index <= descriptor_write_index)
+            min_read_index_after_write = min(min_read_index_after_write, descriptor_read_index);
+        else
+            min_read_index_before_write = min(min_read_index_before_write, descriptor_read_index);
+    }
+
+    if (min_read_index_before_write != std::numeric_limits<uint32_t>::max())
+        return min_read_index_before_write;
+
+    return min_read_index_after_write;
+}
+
+int broker_fd;
+
+vector<uint32_t> drain_disconnected_subscriber_slots() {
+    vector<uint32_t> slot_indices;
     while (true) {
-        const ssize_t n = recv(conn_fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+        char packet[kSubscriberDisconnectedMessageSize];
+        const ssize_t n = recv(broker_fd, &packet, kSubscriberDisconnectedMessageSize, 0);
 
         if (n == 0) {
-            return false;
+            cerr << "[b] Failed to receive subscriber disconnect notification: broker closed the connection" << endl;
+            exit(1);
+        } else if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                cerr << "[b] Failed to receive subscriber disconnect notification: " << strerror(errno) << endl;
+                exit(1);
+            }
         }
 
         if (n > 0) {
-            return true;
-        }
+            BrokerMessageType type = static_cast<BrokerMessageType>(packet[0]);
+            if (type != BrokerMessageType::SubscriberDisconnected) {
+                cerr << "[b] Unexpected subscriber disconnect message type: " << static_cast<int>(packet[0]) << endl;
+                exit(1);
+            }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return true;
-        }
+            size_t body_len = n - 1;
+            if (body_len % sizeof(int) != 0) {
+                cerr << "[b] Invalid subscriber disconnect payload length: " << body_len << endl;
+                exit(1);
+            }
 
-        if (errno == EINTR) {
-            continue;
+            int slot_index;
+            memcpy(&slot_index, packet + 1, body_len);
+            slot_indices.emplace_back(slot_index);
         }
     }
+    return slot_indices;
 }
 
 void release_chunk_references_in_descriptor_range(SharedData *p, size_t start, size_t end, uint8_t subscriber_reference_bit) {
@@ -121,147 +185,94 @@ void release_chunk_references_in_descriptor_range(SharedData *p, size_t start, s
     }
 }
 
-size_t subscriber_slot_index = 0;
-unordered_map<int, size_t> subscriber_slot_index_by_conn_fd{};
+std::unordered_map<int, size_t> subscriber_slot_index_by_event_fd{};
+std::array<int, kMaxSubscribers> event_fd_by_subscriber_slot_index{};
 
-vector<int> conn_fds{};
+void reap_dead_subscribers(SharedData *p) {
+    vector<uint32_t> slot_indices = drain_disconnected_subscriber_slots();
 
-void reap_dead_subscribers(SharedData *p, uint32_t wr) {
-    vector<size_t> dead_subscriber_slot_indices;
-    conn_fds.erase(remove_if(conn_fds.begin(), conn_fds.end(), [&dead_subscriber_slot_indices](int conn_fd) {
-        if (is_peer_alive(conn_fd)) {
-            return false;
-        }
+    for (uint32_t slot_index : slot_indices) {
+        const int event_fd = event_fd_by_subscriber_slot_index[slot_index];
+        subscriber_slot_index_by_event_fd.erase(event_fd);
+        erase(event_fds, event_fd);
 
-        dead_subscriber_slot_indices.emplace_back(subscriber_slot_index_by_conn_fd[conn_fd]);
-        subscriber_slot_index_by_conn_fd.erase(conn_fd);
-        close(conn_fd);
-        return true;
-    }),
-        conn_fds.end());
-
-    for (size_t subscriber_slot_index : dead_subscriber_slot_indices) {
-        uint32_t rd = p->descriptor_read_indices[subscriber_slot_index].load(std::memory_order_acquire);
-        uint8_t subscriber_reference_bit = 1 << subscriber_slot_index;
+        uint8_t subscriber_reference_bit = 1 << slot_index;
+        uint32_t rd = p->descriptor_read_indices[slot_index].load(std::memory_order_acquire);
+        uint32_t wr = p->descriptor_write_index.load(std::memory_order_relaxed);
         if (rd > wr) {
             release_chunk_references_in_descriptor_range(p, rd, kDescriptorSlotCount, subscriber_reference_bit);
             rd = 0;
         }
 
         release_chunk_references_in_descriptor_range(p, rd, wr, subscriber_reference_bit);
-        p->descriptor_read_indices[subscriber_slot_index].store(kInvalidIndex, memory_order_relaxed);
+        p->descriptor_read_indices[slot_index].store(kInvalidIndex, memory_order_relaxed);
     }
-}
-
-void chunk_usage_tracker_init(ChunkUsageTracker &tracker) {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&tracker.mutex, &attr);
-    pthread_mutexattr_destroy(&attr);
-
-    memset(tracker.is_in_use, 0, sizeof(tracker.is_in_use));
-}
-
-void shm_init(SharedData &shm) {
-    for (int i = 0; i < kMaxSubscribers; ++i) {
-        shm.descriptor_read_indices[i].store(kInvalidIndex, memory_order_relaxed);
-    }
-    shm.descriptor_write_index.store(0, memory_order_relaxed);
-
-    shm.head.offset[0].store(0, memory_order_relaxed);
-    for (int i = 1; i < kClassCount; ++i) {
-        shm.head.offset[i].store(shm.head.offset[i - 1].load(memory_order_relaxed) + kClassSizeBytes[i - 1] * kChunkCountBySizeClass[i - 1], memory_order_relaxed);
-    }
-
-    for (int i = 0; i < kClassCount - 1; ++i) {
-        shm.tail.offset[i].store(shm.head.offset[i + 1].load(memory_order_relaxed) - kClassSizeBytes[i], memory_order_relaxed);
-    }
-    shm.tail.offset[kClassCount - 1].store(sizeof(shm.data) - kClassSizeBytes[kClassCount - 1], memory_order_relaxed);
-
-    for (int i = 0; i < kTotalChunkCount; ++i) {
-        shm.chunk_reference_counts[i].store(0, memory_order_relaxed);
-    }
-
-    auto init = [&](uint32_t chunk_size_bytes, const uint32_t chunk_count, uint32_t offset) {
-        for (uint32_t i = 0; i < chunk_count - 1; ++i) {
-            uint32_t next_offset = offset + chunk_size_bytes;
-            memcpy(shm.data + offset, &next_offset, sizeof(uint32_t));
-            offset = next_offset;
-        }
-        memcpy(shm.data + offset, &kInvalidOffset, sizeof(uint32_t));
-    };
-    for (int i = 0; i < kClassCount; ++i) {
-        init(kClassSizeBytes[i], kChunkCountBySizeClass[i], shm.head.offset[i]);
-    }
-}
-
-constexpr size_t kMaxEvents = 1024;
-
-uint32_t find_slowest_read_index(const SharedData *p) {
-    uint32_t min_read_index_before_write = kInvalidIndex;
-    uint32_t min_read_index_after_write = kInvalidIndex;
-    uint32_t descriptor_write_index = p->descriptor_write_index.load(memory_order_relaxed);
-    for (size_t subsrciber_index = 0; subsrciber_index < kMaxSubscribers; ++subsrciber_index) {
-        uint32_t descriptor_read_index = p->descriptor_read_indices[subsrciber_index].load(std::memory_order_acquire);
-        if (descriptor_read_index == kInvalidIndex) continue;
-
-        if (descriptor_read_index <= descriptor_write_index)
-            min_read_index_after_write = min(min_read_index_after_write, descriptor_read_index);
-        else
-            min_read_index_before_write = min(min_read_index_before_write, descriptor_read_index);
-    }
-
-    if (min_read_index_before_write != std::numeric_limits<uint32_t>::max())
-        return min_read_index_before_write;
-
-    return min_read_index_after_write;
 }
 
 int main() {
-    shm_unlink("/shm");
-    int fd = shm_open("/shm", O_CREAT | O_RDWR, 0666);
-    ftruncate(fd, sizeof(SharedData));
-    SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    const string path = "/tmp/broker.sock";
 
-    shm_init(*p);
-#ifdef ENABLE_DEBUG_CHECKS
-    chunk_usage_tracker_init(p->chunk_usage_tracker);
-#endif
+    broker_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
 
-    const string path = "/tmp/demo.sock";
-    unlink(path.c_str());
-
-    int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path.c_str());
 
-    int ret = bind(listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-    if (ret < 0) return -1;
+    int ret = connect(broker_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    int fail_num = 0;
+    while (ret < 0 && fail_num < 3) {
+        sleep(1);
+        ++fail_num;
+        ret = connect(broker_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    }
+    if (ret < 0) {
+        cerr << "[b] Failed to connect to broker after " << fail_num << " attempts: " << strerror(errno) << endl;
+        return -1;
+    }
 
-    ret = listen(listen_fd, 1);
-    if (ret < 0) return -1;
+    BrokerMessageType role = BrokerMessageType::PublisherRegistration;
+    send(broker_fd, &role, sizeof(role), 0);
 
-    cout << "receiver listening...\n";
+    uint32_t subscriber_count;
+    {
+        ssize_t n = recv(broker_fd, &subscriber_count, sizeof(subscriber_count), 0);
+        if (n < 0) {
+            cerr << "[b] Failed to receive subscriber count: " << strerror(errno) << endl;
+            return 1;
+        }
+        cout << "subscriber_count is " << subscriber_count << endl;
+    }
 
-    int conn_fd1 = accept(listen_fd, nullptr, nullptr);
-    conn_fds.emplace_back(conn_fd1);
-    int conn_fd2 = accept(listen_fd, nullptr, nullptr);
-    conn_fds.emplace_back(conn_fd2);
+    for (size_t i = 0; i < subscriber_count; ++i) {
+        auto registration = receive_subscriber_registration(broker_fd);
+        if (!registration) {
+            cerr << "[b] Failed to receive registration for subscriber " << i << endl;
+            return 1;
+        }
 
-    int efd1 = eventfd(0, EFD_NONBLOCK);
-    send_fd(conn_fd1, efd1, subscriber_slot_index);
-    subscriber_slot_index_by_conn_fd.insert({conn_fd1, subscriber_slot_index});
-    ++subscriber_slot_index;
-    int efd2 = eventfd(0, EFD_NONBLOCK);
-    send_fd(conn_fd2, efd2, subscriber_slot_index);
-    subscriber_slot_index_by_conn_fd.insert({conn_fd2, subscriber_slot_index});
-    ++subscriber_slot_index;
+        const int event_fd = registration->event_fd;
+        const uint32_t subscriber_slot_index = registration->slot_index;
+        subscriber_slot_index_by_event_fd.insert({event_fd, subscriber_slot_index});
+        event_fd_by_subscriber_slot_index[subscriber_slot_index] = event_fd;
+        event_fds.emplace_back(event_fd);
 
-    int task_num = 26 * 30000;
+        cout << "event_fd is " << event_fd << ", subscriber_slot_index is " << subscriber_slot_index << endl;
+    }
+
+    set_fd_nonblocking(broker_fd);
+
+    int fd = shm_open("/shm", O_RDWR, 0666);
+    if (fd == -1) {
+        cerr << "[b] Failed to open shared memory /shm" << endl;
+        perror("shm_open");
+        close(fd);
+        return 1;
+    }
+    SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+
+    int task_num = 26 * 3000;
     int seq = 0;
-    uint32_t min_descriptor_read_index = kInvalidIndex;
+    uint32_t min_descriptor_read_index = find_slowest_read_index(p);
     for (char c = 'a'; task_num; ++c) {
         uint32_t message_size_bytes = get_msg_size();
         int size_class = find_size_class(message_size_bytes);
@@ -274,11 +285,13 @@ int main() {
         while (min_descriptor_read_index == kInvalidIndex ||
             (min_descriptor_read_index > wr && min_descriptor_read_index <= wr + 1) ||
             wr + 1 >= min_descriptor_read_index + kDescriptorSlotCount) {
-            reap_dead_subscribers(p, wr);
+            this_thread::sleep_for(chrono::milliseconds(50));
+            reap_dead_subscribers(p);
             min_descriptor_read_index = find_slowest_read_index(p);
             wr = p->descriptor_write_index.load(memory_order_relaxed);
-            // cout << "min_read_index == wr" << endl;
+            cout << "min_read_index == wr: min_read_index is " << min_descriptor_read_index << "  idx " << 1 << " read_index is " << p->descriptor_read_indices[0].load(memory_order_relaxed) << "   idx " << 2 << " read_index is " << p->descriptor_read_indices[1].load(memory_order_relaxed) << endl;
         }
+        cout << "wr is " << wr << endl;
         cout << "min_descriptor_read_index is " << min_descriptor_read_index << endl;
         cout << "idx " << 1 << " read_index is " << p->descriptor_read_indices[0].load(memory_order_relaxed) << endl;
         cout << "idx " << 2 << " read_index is " << p->descriptor_read_indices[1].load(memory_order_relaxed) << endl;
@@ -286,7 +299,8 @@ int main() {
         uint32_t head_off = p->head.offset[size_class].load(memory_order_relaxed);
         uint32_t tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
         while (head_off == tail_off) {
-            reap_dead_subscribers(p, wr);
+            this_thread::sleep_for(chrono::milliseconds(50));
+            reap_dead_subscribers(p);
             tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
             cout << "no node free" << endl;
             // 单写端不需要更新 head_off
@@ -333,31 +347,33 @@ int main() {
         uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
 
         uint8_t chunk_reference_mask = 0;
-        for (size_t conn_fd : conn_fds) {
-            auto it = subscriber_slot_index_by_conn_fd.find(conn_fd);
-            if (it == subscriber_slot_index_by_conn_fd.end()) {
-                cout << "error: invalid conn_fd" << endl;
+        for (size_t event_fd : event_fds) {
+            auto it = subscriber_slot_index_by_event_fd.find(event_fd);
+            if (it == subscriber_slot_index_by_event_fd.end()) {
+                cout << "error: invalid event_fd" << endl;
                 exit(1);
             }
-            chunk_reference_mask += 1 << subscriber_slot_index_by_conn_fd[conn_fd];
+            chunk_reference_mask += 1 << subscriber_slot_index_by_event_fd[event_fd];
         }
+        cout << "chunk_reference_mask is " << static_cast<int>(chunk_reference_mask) << endl;
         p->chunk_reference_counts[chunk_index].fetch_add(chunk_reference_mask, memory_order_relaxed); // 1 默认只是int,后续需要修改
 
         uint32_t candidate = wr + 1;
         if (candidate >= kDescriptorSlotCount) p->descriptor_write_index.store(candidate % kDescriptorSlotCount, std::memory_order_release);
         else p->descriptor_write_index.store(candidate, std::memory_order_release);
-        cout << "candidate is " << candidate << endl;
 
         uint64_t val = 1;
-        write(efd1, &val, sizeof(val));
-        write(efd2, &val, sizeof(val));
+        for (int event_fd : event_fds) {
+            write(event_fd, &val, sizeof(val));
+        }
         cout << "write " << message_size_bytes << " byte " << c << ", seq is " << seq - 1 << endl;
         --task_num;
         if (c == 'z') c = 'a' - 1;
     }
     uint64_t val = 1;
-    write(efd1, &val, sizeof(val));
-    write(efd2, &val, sizeof(val));
+    for (int event_fd : event_fds) {
+        write(event_fd, &val, sizeof(val));
+    }
     cout << "all write over" << endl;
 
     munmap(p, sizeof(SharedData));

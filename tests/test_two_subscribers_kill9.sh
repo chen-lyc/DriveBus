@@ -18,7 +18,7 @@
 set -Eeuo pipefail
 
 readonly kRepoRoot="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly kSocketPath='/tmp/demo.sock'
+readonly kSocketPath='/tmp/broker.sock'
 readonly kSharedMemoryPath='/dev/shm/shm'
 readonly kLockPath='/tmp/drivebus-two-subscribers-kill9.lock'
 readonly kDescriptorSlotCount=16
@@ -29,6 +29,7 @@ readonly kPhaseTimeoutSeconds="${PHASE_TIMEOUT_SECONDS:-30}"
 readonly kCaseCount="${CASE_COUNT:-2}"
 readonly kCxx="${CXX:-g++}"
 
+broker_pid=''
 publisher_pid=''
 subscriber_one_pid=''
 subscriber_two_pid=''
@@ -40,6 +41,8 @@ run_dir=''
 owns_ipc_resources=0
 test_passed=0
 
+broker_log=''
+broker_stderr=''
 publisher_log=''
 publisher_stderr=''
 subscriber_one_log=''
@@ -93,6 +96,7 @@ cleanup() {
     stop_process "$publisher_pid"
     stop_process "$subscriber_one_pid"
     stop_process "$subscriber_two_pid"
+    stop_process "$broker_pid"
     stop_process "$publisher_filter_pid"
     stop_process "$subscriber_one_filter_pid"
     stop_process "$subscriber_two_filter_pid"
@@ -129,6 +133,8 @@ print_file_tail() {
 }
 
 print_case_logs() {
+    print_file_tail 'broker output' "$broker_log"
+    print_file_tail 'broker stderr' "$broker_stderr"
     print_file_tail 'publisher output' "$publisher_log"
     print_file_tail 'publisher stderr' "$publisher_stderr"
     print_file_tail 'subscriber 1 output' "$subscriber_one_log"
@@ -139,7 +145,7 @@ print_case_logs() {
 
 filter_relevant_output() {
     grep --line-buffered -E \
-        '^(receiver listening\.\.\.|read [0-9]+ byte, offset is [0-9]+, seq is [0-9]+|write [0-9]+ byte .*, seq is [0-9]+|subscriber_read_index is [0-9]+|error magic:.*|error seq:.*|.*size is too big.*|.*chunk free twice.*|.*chunk error use again.*|.*offset is out of range.*|.*error: invalid conn_fd.*|time out|all write over)$'
+        '^(receiver listening\.\.\.|read [0-9]+ byte, offset is [0-9]+, seq is [0-9]+|write [0-9]+ byte .*, seq is [0-9]+|subscriber_slot_index is [0-9]+|subscriber_read_index is [0-9]+|error magic:.*|error seq:.*|.*size is too big.*|.*chunk free twice.*|.*chunk error use again.*|.*offset is out of range.*|.*error: invalid conn_fd.*|time out|all write over)$'
 }
 
 last_sequence() {
@@ -166,6 +172,7 @@ last_sequence() {
 has_failure_evidence() {
     grep -Eqs \
         'error magic:|error seq:|size is too big|chunk free twice|chunk error use again|offset is out of range|error: invalid conn_fd|^time out$' \
+        "$broker_log" "$broker_stderr" \
         "$publisher_log" "$publisher_stderr" \
         "$subscriber_one_log" "$subscriber_one_stderr" \
         "$subscriber_two_log" "$subscriber_two_stderr"
@@ -196,13 +203,33 @@ wait_for_socket() {
     local deadline=$((SECONDS + kPhaseTimeoutSeconds))
 
     while (( SECONDS < deadline )); do
-        assert_running 'publisher' "$publisher_pid"
+        assert_running 'broker' "$broker_pid"
         assert_no_failure_evidence
         [[ -S "$kSocketPath" ]] && return 0
         sleep 0.02
     done
 
-    fail 'publisher did not create its Unix-domain socket before the deadline'
+    fail 'broker did not create its Unix-domain socket before the deadline'
+}
+
+wait_for_subscriber_registrations() {
+    local deadline=$((SECONDS + kPhaseTimeoutSeconds))
+
+    while (( SECONDS < deadline )); do
+        assert_running 'broker' "$broker_pid"
+        assert_running 'subscriber 1' "$subscriber_one_pid"
+        assert_running 'subscriber 2' "$subscriber_two_pid"
+        assert_no_failure_evidence
+
+        if grep -Eq '^subscriber_slot_index is [0-9]+$' "$subscriber_one_log" &&
+            grep -Eq '^subscriber_slot_index is [0-9]+$' "$subscriber_two_log"; then
+            return 0
+        fi
+
+        sleep 0.02
+    done
+
+    fail 'both subscribers did not complete broker registration before the deadline'
 }
 
 wait_for_both_subscribers() {
@@ -263,25 +290,22 @@ wait_for_post_kill_progress() {
 }
 
 build_binaries() {
-    local subscriber_binary="$run_dir/subscriber"
-    local publisher_binary="$run_dir/publisher"
-    local compiler_flags=(-std=gnu++17 -O0 -g -pthread -DENABLE_DEBUG_CHECKS)
-
     printf 'Building test binaries with %s...\n' "$kCxx"
-    "$kCxx" "${compiler_flags[@]}" "$kRepoRoot/a.cpp" -o "$subscriber_binary"
-    "$kCxx" "${compiler_flags[@]}" "$kRepoRoot/b.cpp" -o "$publisher_binary"
+    make -C "$kRepoRoot" -B "CXX=$kCxx" DEBUG_CHECKS=1 DEBUG_SYMBOLS=1 all
 }
 
 stop_case_processes() {
     stop_process "$publisher_pid"
     stop_process "$subscriber_one_pid"
     stop_process "$subscriber_two_pid"
+    stop_process "$broker_pid"
     stop_process "$publisher_filter_pid"
     stop_process "$subscriber_one_filter_pid"
     stop_process "$subscriber_two_filter_pid"
     publisher_pid=''
     subscriber_one_pid=''
     subscriber_two_pid=''
+    broker_pid=''
     publisher_filter_pid=''
     subscriber_one_filter_pid=''
     subscriber_two_filter_pid=''
@@ -296,8 +320,9 @@ stop_case_processes() {
 
 run_case() {
     local case_number="$1"
-    local subscriber_binary="$run_dir/subscriber"
-    local publisher_binary="$run_dir/publisher"
+    local broker_binary="$kRepoRoot/broker.out"
+    local subscriber_binary="$kRepoRoot/a.out"
+    local publisher_binary="$kRepoRoot/b.out"
     local victim_name
     local victim_pid
     local survivor_name
@@ -311,10 +336,10 @@ run_case() {
     local publisher_target
     local survivor_target
 
-    assert_ipc_namespace_is_idle
-
     current_case_dir="$run_dir/case-$case_number"
     mkdir -p -- "$current_case_dir"
+    broker_log="$current_case_dir/broker.log"
+    broker_stderr="$current_case_dir/broker.stderr"
     publisher_log="$current_case_dir/publisher.log"
     publisher_stderr="$current_case_dir/publisher.stderr"
     subscriber_one_log="$current_case_dir/subscriber-1.log"
@@ -327,10 +352,8 @@ run_case() {
 
     owns_ipc_resources=1
     mkfifo "$publisher_fifo" "$subscriber_one_fifo" "$subscriber_two_fifo"
-    filter_relevant_output < "$publisher_fifo" > "$publisher_log" &
-    publisher_filter_pid=$!
-    "$publisher_binary" > "$publisher_fifo" 2> "$publisher_stderr" &
-    publisher_pid=$!
+    "$broker_binary" > "$broker_log" 2> "$broker_stderr" &
+    broker_pid=$!
     wait_for_socket
 
     filter_relevant_output < "$subscriber_one_fifo" > "$subscriber_one_log" &
@@ -341,6 +364,13 @@ run_case() {
     subscriber_two_filter_pid=$!
     "$subscriber_binary" > "$subscriber_two_fifo" 2> "$subscriber_two_stderr" &
     subscriber_two_pid=$!
+
+    wait_for_subscriber_registrations
+
+    filter_relevant_output < "$publisher_fifo" > "$publisher_log" &
+    publisher_filter_pid=$!
+    "$publisher_binary" > "$publisher_fifo" 2> "$publisher_stderr" &
+    publisher_pid=$!
 
     wait_for_both_subscribers
 
@@ -403,6 +433,7 @@ is_positive_integer "$kPhaseTimeoutSeconds" || fail 'PHASE_TIMEOUT_SECONDS must 
 is_positive_integer "$kCaseCount" || fail 'CASE_COUNT must be a positive integer'
 (( kPostKillSequenceDelta > kDescriptorSlotCount )) || fail 'POST_KILL_SEQUENCE_DELTA must exceed the 16 descriptor slots'
 command -v "$kCxx" >/dev/null 2>&1 || fail "C++ compiler not found: $kCxx"
+command -v make >/dev/null 2>&1 || fail 'make is required to build the current binaries'
 command -v flock >/dev/null 2>&1 || fail 'flock is required to prevent concurrent test-script runs'
 
 run_dir="$(mktemp -d "${TMPDIR:-/tmp}/drivebus-two-subscribers-kill9.XXXXXX")"
