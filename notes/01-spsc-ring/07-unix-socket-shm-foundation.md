@@ -341,6 +341,26 @@ memset(control, 0, sizeof(control));  // ← 防御性清零
 - **发送方**：避免 padding 字节残留栈垃圾，`cmsg_len` 精确描述了实际使用的长度
 - **接收方**：`recvmsg` 不一定填满整个缓冲区，未填充区域可能是旧数据。清零后即使误读了也不会拿到假的控制消息
 
+### 3.9 `send()`/`recv()` 与 `sendmsg()`/`recvmsg()` 的关系
+
+`send()` 和 `recv()` 内部只是没有 control 的 `msghdr`。Linux 内核中，`send()` 最终走到 `__sys_sendto()`，内核构造一个 `msg_control = NULL`、`msg_controllen = 0` 的 `msghdr` 再进入统一发送路径。`recv()` 同理。
+
+所以 `recvmsg()` 可以接收 `send()` 发出的消息——普通数据写入 `msg_iov`，`CMSG_FIRSTHDR(&msg)` 返回 `nullptr`（因为没有 control 数据）。
+
+```cpp
+// 这两者是等价的
+send(fd, buf, len, 0);
+
+struct msghdr msg{};
+msg.msg_iov = ...;       // buf
+msg.msg_iovlen = 1;
+msg.msg_control = NULL;  // 没有控制数据
+msg.msg_controllen = 0;
+sendmsg(fd, &msg, 0);
+```
+
+> **记忆**：`msghdr` 的 `hdr`（header）指系统调用参数结构，不是你协议里的 `message_type + payload`。它是给 `sendmsg`/`recvmsg` 的"说明书"，不是 packet 的格式。
+
 ---
 
 ## 四、字符串与二进制约定
