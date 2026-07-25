@@ -103,6 +103,8 @@ slot 0 之后再按 descriptor 的 offset 读 payload，看到 15360
 
 `magic` 不匹配不必然等于 free-list 覆盖；本次结论依赖三段证据同时成立：`15360 == 14336 + 1024`、源码确实会把 next offset 写进 chunk 头、并且位图遗漏了一个活跃读端。缺少其中任一段时，只能把 free list 当作待验证假设。
 
+相同的 `magic == next offset` 症状也可能来自晚加入订阅者读错自己的起始 descriptor：这时历史 chunk 对真实 holder 而言是合法归还的，错误在 reader 的读取资格而非发布 mask。见 [05：晚加入订阅者从错误起点读取](05-late-subscriber-wrong-read-start.md)。
+
 ## 代码锚点（本次工作区快照）
 
 - [size class、chunk 大小与首偏移](../../include/shared_memory_layout.hpp#L12-L44)

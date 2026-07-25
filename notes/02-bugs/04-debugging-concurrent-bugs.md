@@ -2,7 +2,7 @@
 
 > 范围快照：最后核对提交 `36b7b0f`（2026-07-19）。本页只记录方法——如何从症状推到根因，不替代单次事故的完整复盘。
 >
-> 相关：[数量关系是证据](02-debugging-numeric-patterns.md) · [magic 被 free list 覆盖](03-magic-overwritten-by-free-list.md)
+> 相关：[数量关系是证据](02-debugging-numeric-patterns.md) · [magic 被 free list 覆盖](03-magic-overwritten-by-free-list.md) · [晚加入订阅者读错历史 chunk](05-late-subscriber-wrong-read-start.md)
 
 ## 核心模式
 
