@@ -50,10 +50,11 @@ struct SubscriberRegistration {
 optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) {
     struct msghdr msg{};
 
-    uint32_t received_subscriber_slot_index;
+    char packet[kSubscriberRegisteredMessageSize];
+
     struct iovec iov{};
-    iov.iov_base = &received_subscriber_slot_index;
-    iov.iov_len = sizeof(received_subscriber_slot_index);
+    iov.iov_base = &packet;
+    iov.iov_len = sizeof(packet);
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -65,22 +66,21 @@ optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) 
     msg.msg_controllen = sizeof(control);
 
     ssize_t ret = recvmsg(broker_fd, &msg, 0);
-    if (ret < 0) {
-        cerr << "[b] Failed to receive subscriber registration: recvmsg: " << strerror(errno) << endl;
-        return nullopt;
-    }
+    if (ret < 0) return nullopt;
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg == nullptr) {
-        cerr << "[b] Failed to receive subscriber registration: no SCM_RIGHTS file descriptor in message" << endl;
-        return nullopt;
-    }
-    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-        cerr << "[b] Failed to receive subscriber registration: ancillary message is not SCM_RIGHTS" << endl;
-        return nullopt;
-    }
+    if (cmsg == nullptr) return nullopt;
+    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return nullopt;
 
     int fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    BrokerMessageType message_type = static_cast<BrokerMessageType>(packet[0]);
+    if (message_type != BrokerMessageType::SubscriberRegistered) {
+        cerr << "registered message_type error" << endl;
+        exit(1);
+    }
+    uint32_t received_subscriber_slot_index;
+    memcpy(&received_subscriber_slot_index, packet + 1, sizeof(received_subscriber_slot_index));
+
     return SubscriberRegistration{fd, received_subscriber_slot_index};
 }
 
@@ -88,7 +88,9 @@ vector<int> event_fds{};
 
 constexpr size_t kMaxEvents = 1024;
 
-uint32_t find_slowest_read_index(const SharedData *p) {
+SharedData *p;
+
+uint32_t find_slowest_read_index() {
     uint32_t min_read_index_before_write = kInvalidIndex;
     uint32_t min_read_index_after_write = kInvalidIndex;
     uint32_t descriptor_write_index = p->descriptor_write_index.load(memory_order_relaxed);
@@ -108,48 +110,7 @@ uint32_t find_slowest_read_index(const SharedData *p) {
     return min_read_index_after_write;
 }
 
-int broker_fd;
-
-vector<uint32_t> drain_disconnected_subscriber_slots() {
-    vector<uint32_t> slot_indices;
-    while (true) {
-        char packet[kSubscriberDisconnectedMessageSize];
-        const ssize_t n = recv(broker_fd, &packet, kSubscriberDisconnectedMessageSize, 0);
-
-        if (n == 0) {
-            cerr << "[b] Failed to receive subscriber disconnect notification: broker closed the connection" << endl;
-            exit(1);
-        } else if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            } else {
-                cerr << "[b] Failed to receive subscriber disconnect notification: " << strerror(errno) << endl;
-                exit(1);
-            }
-        }
-
-        if (n > 0) {
-            BrokerMessageType type = static_cast<BrokerMessageType>(packet[0]);
-            if (type != BrokerMessageType::SubscriberDisconnected) {
-                cerr << "[b] Unexpected subscriber disconnect message type: " << static_cast<int>(packet[0]) << endl;
-                exit(1);
-            }
-
-            size_t body_len = n - 1;
-            if (body_len % sizeof(int) != 0) {
-                cerr << "[b] Invalid subscriber disconnect payload length: " << body_len << endl;
-                exit(1);
-            }
-
-            int slot_index;
-            memcpy(&slot_index, packet + 1, body_len);
-            slot_indices.emplace_back(slot_index);
-        }
-    }
-    return slot_indices;
-}
-
-void release_chunk_references_in_descriptor_range(SharedData *p, size_t start, size_t end, uint8_t subscriber_reference_bit) {
+void release_chunk_references_in_descriptor_range(size_t start, size_t end, uint8_t subscriber_reference_bit) {
     while (start < end) {
         uint32_t offset = p->desc_ring[start].offset;
         uint32_t len = p->desc_ring[start].len;
@@ -188,24 +149,113 @@ void release_chunk_references_in_descriptor_range(SharedData *p, size_t start, s
 std::unordered_map<int, size_t> subscriber_slot_index_by_event_fd{};
 std::array<int, kMaxSubscribers> event_fd_by_subscriber_slot_index{};
 
-void reap_dead_subscribers(SharedData *p) {
-    vector<uint32_t> slot_indices = drain_disconnected_subscriber_slots();
+void reap_dead_subscribers(uint32_t slot_index) {
+    uint8_t subscriber_reference_bit = 1 << slot_index;
+    uint32_t rd = p->descriptor_read_indices[slot_index].load(std::memory_order_acquire);
+    uint32_t wr = p->descriptor_write_index.load(std::memory_order_relaxed);
+    if (rd > wr) {
+        release_chunk_references_in_descriptor_range(rd, kDescriptorSlotCount, subscriber_reference_bit);
+        rd = 0;
+    }
 
-    for (uint32_t slot_index : slot_indices) {
-        const int event_fd = event_fd_by_subscriber_slot_index[slot_index];
-        subscriber_slot_index_by_event_fd.erase(event_fd);
-        erase(event_fds, event_fd);
+    release_chunk_references_in_descriptor_range(rd, wr, subscriber_reference_bit);
+    p->descriptor_read_indices[slot_index].store(kInvalidIndex, memory_order_relaxed);
 
-        uint8_t subscriber_reference_bit = 1 << slot_index;
-        uint32_t rd = p->descriptor_read_indices[slot_index].load(std::memory_order_acquire);
-        uint32_t wr = p->descriptor_write_index.load(std::memory_order_relaxed);
-        if (rd > wr) {
-            release_chunk_references_in_descriptor_range(p, rd, kDescriptorSlotCount, subscriber_reference_bit);
-            rd = 0;
+    const int event_fd = event_fd_by_subscriber_slot_index[slot_index];
+    subscriber_slot_index_by_event_fd.erase(event_fd);
+    erase(event_fds, event_fd);
+    close(event_fd);
+}
+
+void track_subscriber(SubscriberRegistration registration) {
+    if (registration.slot_index >= kMaxSubscribers) {
+        cerr << "registration slot_index out of range: slot_index is " << registration.slot_index << endl;
+        exit(1);
+    }
+
+    subscriber_slot_index_by_event_fd.insert({registration.event_fd, registration.slot_index});
+    event_fd_by_subscriber_slot_index[registration.slot_index] = registration.event_fd;
+    event_fds.emplace_back(registration.event_fd);
+
+    p->descriptor_read_indices[registration.slot_index].store(p->descriptor_write_index.load(memory_order_relaxed), memory_order_relaxed);
+}
+
+int broker_fd;
+
+void process_broker_contorl_messages() {
+    char packet[kMaxMessageSize];
+    char control[CMSG_SPACE(sizeof(int))];
+
+    struct iovec iov{};
+    iov.iov_base = packet;
+    iov.iov_len = kMaxMessageSize;
+
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+
+    while (true) {
+        msg.msg_controllen = sizeof(control);
+
+        const ssize_t received_size = recvmsg(broker_fd, &msg, 0);
+
+        if (received_size == 0) {
+            cerr << "[b] Failed to receive broker message: broker closed the connection" << endl;
+            break;
+        } else if (received_size < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                cerr << "[b] Failed to receive broker message: " << strerror(errno) << endl;
+                exit(1);
+            }
         }
 
-        release_chunk_references_in_descriptor_range(p, rd, wr, subscriber_reference_bit);
-        p->descriptor_read_indices[slot_index].store(kInvalidIndex, memory_order_relaxed);
+        size_t body_len = received_size - 1;
+        auto message_type = static_cast<BrokerMessageType>(packet[0]);
+
+        switch (message_type) {
+            case BrokerMessageType::SubscriberDisconnected: {
+                if (body_len % sizeof(uint32_t) != 0) {
+                    cerr << "[b] Invalid subscriber disconnect payload length: " << body_len << endl;
+                    exit(1);
+                }
+
+                uint32_t subscriber_slot_index;
+                memcpy(&subscriber_slot_index, packet + 1, body_len);
+                reap_dead_subscribers(subscriber_slot_index);
+                break;
+            }
+            case BrokerMessageType::SubscriberRegistered: {
+                if (body_len % sizeof(uint32_t) != 0) {
+                    cerr << "[b] Invalid subscriber disconnect payload length: " << body_len << endl;
+                    exit(1);
+                }
+
+                uint32_t subscriber_slot_index;
+                memcpy(&subscriber_slot_index, packet + 1, sizeof(subscriber_slot_index));
+
+                struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
+                if (cmsg == nullptr) {
+                    cerr << "[b] Failed to receive subscriber registration: no SCM_RIGHTS file descriptor in message" << endl;
+                    exit(1);
+                }
+                if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+                    cerr << "[b] Failed to receive subscriber registration: ancillary message is not SCM_RIGHTS" << endl;
+                    exit(1);
+                }
+
+                const int event_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+                track_subscriber({event_fd, subscriber_slot_index});
+                break;
+            }
+            default: {
+                cerr << "receive other message" << endl;
+                exit(1);
+            }
+        }
     }
 }
 
@@ -230,8 +280,17 @@ int main() {
         return -1;
     }
 
-    BrokerMessageType role = BrokerMessageType::PublisherRegistration;
-    send(broker_fd, &role, sizeof(role), 0);
+    int fd = shm_open("/shm", O_RDWR, 0666);
+    if (fd == -1) {
+        cerr << "[b] Failed to open shared memory /shm" << endl;
+        perror("shm_open");
+        close(fd);
+        return 1;
+    }
+    p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+
+    BrokerMessageType type = BrokerMessageType::PublisherRegistration;
+    send(broker_fd, &type, sizeof(type), 0);
 
     uint32_t subscriber_count;
     {
@@ -250,29 +309,14 @@ int main() {
             return 1;
         }
 
-        const int event_fd = registration->event_fd;
-        const uint32_t subscriber_slot_index = registration->slot_index;
-        subscriber_slot_index_by_event_fd.insert({event_fd, subscriber_slot_index});
-        event_fd_by_subscriber_slot_index[subscriber_slot_index] = event_fd;
-        event_fds.emplace_back(event_fd);
-
-        cout << "event_fd is " << event_fd << ", subscriber_slot_index is " << subscriber_slot_index << endl;
+        track_subscriber(registration.value());
     }
 
     set_fd_nonblocking(broker_fd);
 
-    int fd = shm_open("/shm", O_RDWR, 0666);
-    if (fd == -1) {
-        cerr << "[b] Failed to open shared memory /shm" << endl;
-        perror("shm_open");
-        close(fd);
-        return 1;
-    }
-    SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-
     int task_num = 26 * 3000;
     int seq = 0;
-    uint32_t min_descriptor_read_index = find_slowest_read_index(p);
+    uint32_t min_descriptor_read_index = find_slowest_read_index();
     for (char c = 'a'; task_num; ++c) {
         uint32_t message_size_bytes = get_msg_size();
         int size_class = find_size_class(message_size_bytes);
@@ -286,9 +330,8 @@ int main() {
             (min_descriptor_read_index > wr && min_descriptor_read_index <= wr + 1) ||
             wr + 1 >= min_descriptor_read_index + kDescriptorSlotCount) {
             this_thread::sleep_for(chrono::milliseconds(50));
-            reap_dead_subscribers(p);
-            min_descriptor_read_index = find_slowest_read_index(p);
-            wr = p->descriptor_write_index.load(memory_order_relaxed);
+            process_broker_contorl_messages();
+            min_descriptor_read_index = find_slowest_read_index();
             cout << "min_read_index == wr: min_read_index is " << min_descriptor_read_index << "  idx " << 1 << " read_index is " << p->descriptor_read_indices[0].load(memory_order_relaxed) << "   idx " << 2 << " read_index is " << p->descriptor_read_indices[1].load(memory_order_relaxed) << endl;
         }
         cout << "wr is " << wr << endl;
@@ -300,7 +343,7 @@ int main() {
         uint32_t tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
         while (head_off == tail_off) {
             this_thread::sleep_for(chrono::milliseconds(50));
-            reap_dead_subscribers(p);
+            process_broker_contorl_messages();
             tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
             cout << "no node free" << endl;
             // 单写端不需要更新 head_off
@@ -346,6 +389,8 @@ int main() {
         uint32_t local_chunk_index = (head_off - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
         uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
 
+        process_broker_contorl_messages();
+
         uint8_t chunk_reference_mask = 0;
         for (size_t event_fd : event_fds) {
             auto it = subscriber_slot_index_by_event_fd.find(event_fd);
@@ -356,7 +401,7 @@ int main() {
             chunk_reference_mask += 1 << subscriber_slot_index_by_event_fd[event_fd];
         }
         cout << "chunk_reference_mask is " << static_cast<int>(chunk_reference_mask) << endl;
-        p->chunk_reference_counts[chunk_index].fetch_add(chunk_reference_mask, memory_order_relaxed); // 1 默认只是int,后续需要修改
+        p->chunk_reference_counts[chunk_index].fetch_add(chunk_reference_mask, memory_order_relaxed);
 
         uint32_t candidate = wr + 1;
         if (candidate >= kDescriptorSlotCount) p->descriptor_write_index.store(candidate % kDescriptorSlotCount, std::memory_order_release);

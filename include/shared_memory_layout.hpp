@@ -6,7 +6,7 @@
 #include <pthread.h>
 
 inline constexpr uint32_t kDescriptorSlotCount = 16;
-inline constexpr size_t kMaxSubscribers = 2;
+inline constexpr size_t kMaxSubscribers = 16;
 inline constexpr uint32_t kInvalidIndex = std::numeric_limits<uint32_t>::max();
 
 inline constexpr int kClassCount = 5;
@@ -69,7 +69,7 @@ struct SharedData {
     MessageDescriptor desc_ring[kDescriptorSlotCount];
     FreeListHeads head;
     FreeListTails tail;
-    std::atomic<uint8_t> chunk_reference_counts[kTotalChunkCount]{};
+    std::atomic<uint32_t> chunk_reference_counts[kTotalChunkCount]{};
     char data[1024 * 21];
 
 #ifdef ENABLE_DEBUG_CHECKS

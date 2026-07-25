@@ -18,10 +18,10 @@
 #include <stdint.h>
 using namespace std;
 
-int expected_seq = 0;
+int expected_seq = -1;
 
-uint32_t subscriber_read_index = 0;
-size_t subscriber_slot_index;
+uint32_t subscriber_read_index = kInvalidIndex;
+size_t next_subscriber_slot_index;
 
 struct SubscriberRegistration {
     int event_fd;
@@ -31,10 +31,11 @@ struct SubscriberRegistration {
 optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) {
     struct msghdr msg{};
 
-    uint32_t received_subscriber_slot_index;
+    char packet[kSubscriberRegisteredMessageSize];
+
     struct iovec iov{};
-    iov.iov_base = &received_subscriber_slot_index;
-    iov.iov_len = sizeof(received_subscriber_slot_index);
+    iov.iov_base = &packet;
+    iov.iov_len = sizeof(packet);
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -53,6 +54,14 @@ optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) 
     if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return nullopt;
 
     int fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    BrokerMessageType message_type = static_cast<BrokerMessageType>(packet[0]);
+    if (message_type != BrokerMessageType::SubscriberRegistered) {
+        cerr << "registered message_type error" << endl;
+        exit(1);
+    }
+    uint32_t received_subscriber_slot_index;
+    memcpy(&received_subscriber_slot_index, packet + 1, sizeof(received_subscriber_slot_index));
+
     return SubscriberRegistration{fd, received_subscriber_slot_index};
 }
 
@@ -71,6 +80,9 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
         memcpy(&magic, p->data + offset, sizeof(int));
         memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
         cout << "read " << message_size_bytes << " byte, offset is " << offset << ", seq is " << seq << endl;
+
+        if (expected_seq == -1) expected_seq = seq;
+
         bool is_error = false;
         if (magic != kMagic) {
             cout << "error magic: expected is " << kMagic << ", actual is " << magic << endl;
@@ -98,11 +110,11 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], const size_t descri
 
         uint32_t local_chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
         uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
-        uint8_t subscriber_reference_bit = 1 << subscriber_slot_index;
+        uint8_t subscriber_reference_bit = 1 << next_subscriber_slot_index;
         uint8_t previous_reference_count = p->chunk_reference_counts[chunk_index].fetch_and(~subscriber_reference_bit, std::memory_order_acq_rel);
 
         if (++subscriber_read_index >= kDescriptorSlotCount) subscriber_read_index %= kDescriptorSlotCount;
-        p->descriptor_read_indices[subscriber_slot_index].store(subscriber_read_index, std::memory_order_release);
+        p->descriptor_read_indices[next_subscriber_slot_index].store(subscriber_read_index, std::memory_order_release);
         cout << "subscriber_read_index is " << subscriber_read_index << endl;
 
         if (previous_reference_count == subscriber_reference_bit) {
@@ -160,6 +172,14 @@ int main() {
     }
     if (ret < 0) return -1;
 
+    int fd = shm_open("/shm", O_RDWR, 0666);
+    if (fd == -1) {
+        perror("shm_open");
+        close(fd);
+        return 1;
+    }
+    SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+
     BrokerMessageType role = BrokerMessageType::SubscriberRegistration;
     {
         ssize_t n = send(sock, &role, sizeof(role), 0);
@@ -171,23 +191,14 @@ int main() {
         return 1;
     }
     int efd = registration->event_fd;
-    subscriber_slot_index = registration->slot_index;
-    cout << "subscriber_slot_index is " << subscriber_slot_index << endl;
+    next_subscriber_slot_index = registration->slot_index;
+    cout << "subscriber_slot_index is " << next_subscriber_slot_index << endl;
 
     int epollfd = epoll_create1(0);
     epoll_event event;
     event.data.fd = efd;
     event.events = EPOLLET | EPOLLIN;
     epoll_ctl(epollfd, EPOLL_CTL_ADD, efd, &event);
-
-    int fd = shm_open("/shm", O_RDWR, 0666);
-    if (fd == -1) {
-        perror("shm_open");
-        close(fd);
-        return 1;
-    }
-    SharedData *p = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    p->descriptor_read_indices[subscriber_slot_index].store(0, memory_order_relaxed);
 
     uint64_t val;
     ssize_t n = read(efd, &val, sizeof(val));
@@ -199,6 +210,7 @@ int main() {
 
     int maxevents = 1024;
     epoll_event events[maxevents];
+
     while (true) {
         int event_count = epoll_wait(epollfd, events, maxevents, 3000);
         cout << "event_cout = " << event_count << endl;
@@ -212,6 +224,9 @@ int main() {
             if (fd == efd) {
                 uint64_t val;
                 read(efd, &val, sizeof(val));
+
+                if (subscriber_read_index == kInvalidIndex)
+                    subscriber_read_index = p->descriptor_read_indices[registration->slot_index].load(memory_order_relaxed);
 
                 uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
                 cout << "wr is " << wr << ", rd is " << subscriber_read_index << endl;

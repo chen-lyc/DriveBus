@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstddef>
 #include <iostream>
+#include <queue>
 #include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -21,12 +22,16 @@
 #include <vector>
 using namespace std;
 
-void send_fd(int conn_fd, int send_fd, uint32_t send_subscriber_slot_index) {
+void send_subscriber_registered_message(int conn_fd, int send_fd, uint32_t send_subscriber_slot_index) {
     struct msghdr msg{};
 
+    char packet[kSubscriberRegisteredMessageSize];
+    packet[0] = static_cast<char>(BrokerMessageType::SubscriberRegistered);
+    memcpy(packet + 1, &send_subscriber_slot_index, sizeof(send_subscriber_slot_index));
+
     struct iovec iov;
-    iov.iov_base = &send_subscriber_slot_index;
-    iov.iov_len = sizeof(send_subscriber_slot_index);
+    iov.iov_base = &packet;
+    iov.iov_len = sizeof(packet);
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -46,7 +51,7 @@ void send_fd(int conn_fd, int send_fd, uint32_t send_subscriber_slot_index) {
     sendmsg(conn_fd, &msg, 0);
 }
 
-void chunk_usage_tracker_init(ChunkUsageTracker &tracker) {
+void init_chunk_usage_tracker(ChunkUsageTracker &tracker) {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
@@ -57,7 +62,7 @@ void chunk_usage_tracker_init(ChunkUsageTracker &tracker) {
     memset(tracker.is_in_use, 0, sizeof(tracker.is_in_use));
 }
 
-void shm_init(SharedData &shm) {
+void init_shm(SharedData &shm) {
     for (int i = 0; i < kMaxSubscribers; ++i) {
         shm.descriptor_read_indices[i].store(kInvalidIndex, std::memory_order_relaxed);
     }
@@ -90,30 +95,65 @@ void shm_init(SharedData &shm) {
     }
 }
 
-size_t subscriber_slot_index = 0;
+std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> available_subscriber_slot_indices;
+
+void init_avilable_subscriber_slot_indices() {
+    for (size_t slot_index = 0; slot_index < kMaxSubscribers; ++slot_index) {
+        available_subscriber_slot_indices.emplace(slot_index);
+    }
+}
+
 std::unordered_map<int, size_t> subscriber_slot_index_by_event_fd{};
 std::unordered_map<int, size_t> subscriber_slot_index_by_conn_fd{};
 
 vector<int> event_fds;
 vector<int> publisher_fds;
+std::unordered_map<int, BrokerRole> role_by_fd;
 
-void handle_subsciber_disconect(int subscriber_conn_fd) {
-    auto it = subscriber_slot_index_by_conn_fd.find(subscriber_conn_fd);
-    if (it == subscriber_slot_index_by_conn_fd.end()) {
+void handle_subsciber_disconect(int subscriber_fd) {
+    auto conn_it = subscriber_slot_index_by_conn_fd.find(subscriber_fd);
+    if (conn_it == subscriber_slot_index_by_conn_fd.end()) {
         cout << "not find subscriber_slot_index" << endl;
         exit(1);
     }
-    uint32_t subscriber_slot_index = it->second;
+    uint32_t slot_index = conn_it->second;
     for (int publisher_fd : publisher_fds) {
         char packet[kSubscriberDisconnectedMessageSize];
         packet[0] = static_cast<char>(BrokerMessageType::SubscriberDisconnected);
-        memcpy(packet + 1, &subscriber_slot_index, sizeof(subscriber_slot_index));
+        memcpy(packet + 1, &slot_index, sizeof(slot_index));
 
         ssize_t n = send(publisher_fd, packet, kSubscriberDisconnectedMessageSize, 0);
         if (n < 0) exit(1);
     }
 
-    close(subscriber_conn_fd);
+    auto event_it = subscriber_slot_index_by_event_fd.end();
+    for (auto it = subscriber_slot_index_by_event_fd.begin(); it != subscriber_slot_index_by_event_fd.end(); ++it) {
+        if (it->second == slot_index) {
+            event_it = it;
+            break;
+        }
+    }
+    if (event_it == subscriber_slot_index_by_event_fd.end()) {
+        cerr << "event_fd not found for subscriber slot" << endl;
+        exit(1);
+    }
+
+    const int event_fd = event_it->first;
+    subscriber_slot_index_by_conn_fd.erase(conn_it);
+    subscriber_slot_index_by_event_fd.erase(event_it);
+    erase(event_fds, event_fd);
+    role_by_fd.erase(subscriber_fd);
+    available_subscriber_slot_indices.emplace(slot_index);
+
+    close(event_fd);
+    close(subscriber_fd);
+}
+
+void handle_publisher_disconnect(int pubilsher_fd) {
+    erase(publisher_fds, pubilsher_fd);
+    role_by_fd.erase(pubilsher_fd);
+
+    close(pubilsher_fd);
 }
 
 int main() {
@@ -124,9 +164,10 @@ int main() {
     ftruncate(shm_fd, sizeof(SharedData));
     SharedData *p = reinterpret_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
 
-    shm_init(*p);
+    init_shm(*p);
+    init_avilable_subscriber_slot_indices();
 #ifdef ENABLE_DEBUG_CHECKS
-    chunk_usage_tracker_init(p->chunk_usage_tracker);
+    init_chunk_usage_tracker(p->chunk_usage_tracker);
 #endif
 
     const char *unix_path = "/tmp/broker.sock";
@@ -151,8 +192,6 @@ int main() {
 
     int maxevents = 1024;
     epoll_event events[maxevents];
-
-    std::unordered_map<int, BrokerRole> role_by_fd;
 
     while (true) {
         int event_count = epoll_wait(epoll_fd, events, maxevents, -1);
@@ -183,7 +222,10 @@ int main() {
                             cout << "role_by_fd find error" << endl;
                             exit(1);
                         }
-                        if (it->second == BrokerRole::Subscriber) handle_subsciber_disconect(fd);
+
+                        auto role = it->second;
+                        if (role == BrokerRole::Subscriber) handle_subsciber_disconect(fd);
+                        else if (role == BrokerRole::Publisher) handle_publisher_disconnect(fd);
                     }
                 } else if (n == 0) {
                     cout << "fd = " << fd << ", close writing" << endl;
@@ -192,7 +234,10 @@ int main() {
                         cout << "role_by_fd find error" << endl;
                         exit(1);
                     }
-                    if (it->second == BrokerRole::Subscriber) handle_subsciber_disconect(fd);
+
+                    auto role = it->second;
+                    if (role == BrokerRole::Subscriber) handle_subsciber_disconect(fd);
+                    else if (role == BrokerRole::Publisher) handle_publisher_disconnect(fd);
                 } else {
                     if (message_type == BrokerMessageType::SubscriberRegistration) {
                         role_by_fd.insert({fd, BrokerRole::Subscriber});
@@ -200,10 +245,19 @@ int main() {
                         int event_fd = eventfd(0, EFD_NONBLOCK);
                         event_fds.emplace_back(event_fd);
 
-                        send_fd(fd, event_fd, subscriber_slot_index);
-                        subscriber_slot_index_by_event_fd.insert({event_fd, subscriber_slot_index});
-                        subscriber_slot_index_by_conn_fd.insert({fd, subscriber_slot_index});
-                        ++subscriber_slot_index;
+                        if (available_subscriber_slot_indices.empty()) {
+                            cerr << "No available subscriber slots" << endl;
+                            exit(1);
+                        }
+                        uint32_t slot_index = available_subscriber_slot_indices.top();
+                        available_subscriber_slot_indices.pop();
+                        send_subscriber_registered_message(fd, event_fd, slot_index);
+                        subscriber_slot_index_by_event_fd.insert({event_fd, slot_index});
+                        subscriber_slot_index_by_conn_fd.insert({fd, slot_index});
+
+                        for (int publish_fd : publisher_fds) {
+                            send_subscriber_registered_message(publish_fd, event_fd, slot_index);
+                        }
 
                         cout << "send fd and subscriber_slot_index" << endl;
                     } else if (message_type == BrokerMessageType::PublisherRegistration) {
@@ -211,7 +265,7 @@ int main() {
 
                         cout << "publisher need subscriber data" << endl;
                         publisher_fds.emplace_back(fd);
-                        uint32_t subscriber_counts = subscriber_slot_index;
+                        uint32_t subscriber_counts = kMaxSubscribers - available_subscriber_slot_indices.size();
                         ssize_t n = send(fd, &subscriber_counts, sizeof(subscriber_counts), 0);
                         if (n < 0) {
                             cout << "send error" << endl;
@@ -224,8 +278,8 @@ int main() {
                                 cout << "not find subscriber_slot_index" << endl;
                                 exit(1);
                             }
-                            send_fd(fd, event_fd, it->second);
-                            cout << "send event_fd " << event_fd << ", subscriber_slot_index " << subscriber_slot_index << " to publisher" << endl;
+                            send_subscriber_registered_message(fd, event_fd, it->second);
+                            cout << "send event_fd " << event_fd << ", subscriber_slot_index " << it->second << " to publisher" << endl;
                         }
                     }
                 }

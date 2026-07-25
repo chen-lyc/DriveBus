@@ -102,7 +102,7 @@ void read_data(SharedData *p, MessageDescriptor desc_ring[], int n) {
     }
 }
 
-void shm_init(SharedData &shm) {
+void init_shm(SharedData &shm) {
     shm.offset_read.store(0, memory_order_relaxed);
     shm.offset_write.store(0, memory_order_relaxed);
 
@@ -217,7 +217,7 @@ void run_b(SharedData *p) {
 
 int main() {
     SharedData shm{};
-    shm_init(shm);
+    init_shm(shm);
 
     thread a_thread(run_a, &shm);
     thread b_thread(run_b, &shm);
