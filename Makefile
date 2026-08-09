@@ -25,8 +25,8 @@ all: $(TARGETS)
 rebuild:
 	$(MAKE) -B all
 
-a.out: a.cpp $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) a.cpp -o $@
+a.out: a.cpp src/fd_helpers.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) a.cpp src/fd_helpers.cpp -o $@
 
 b.out: b.cpp src/fd_helpers.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) b.cpp src/fd_helpers.cpp -o $@
