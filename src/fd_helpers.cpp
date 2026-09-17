@@ -1,3 +1,4 @@
+#include "../include/fd_helpers.hpp"
 #include <cstring>
 #include <fcntl.h>
 #include <sys/epoll.h>
@@ -15,6 +16,13 @@ void add_fd_to_epoll(int epoll_fd, int fd) {
     event.events = EPOLLET | EPOLLIN;
     set_fd_nonblocking(fd);
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event);
+}
+
+bool is_valid_scm_rights_cmsg(cmsghdr *cmsg) {
+    return cmsg != nullptr &&
+        cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_RIGHTS &&
+        cmsg->cmsg_len >= CMSG_LEN(0);
 }
 
 ssize_t send_packet_with_fd(int conn_fd, void *packet, size_t packet_size, int fd_to_send) {
@@ -42,6 +50,33 @@ ssize_t send_packet_with_fd(int conn_fd, void *packet, size_t packet_size, int f
     return sendmsg(conn_fd, &msg, 0);
 }
 
+ssize_t send_packet_with_fds(int conn_fd, void *packet, size_t packet_size, const std::vector<int> &fds_to_send) {
+    struct iovec iov;
+    iov.iov_base = packet;
+    iov.iov_len = packet_size;
+
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    size_t len = sizeof(int) * fds_to_send.size();
+    std::vector<char> control(CMSG_SPACE(len), 0);
+
+    if (!fds_to_send.empty()) {
+        msg.msg_control = control.data();
+        msg.msg_controllen = control.size();
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(len);
+
+        memcpy(CMSG_DATA(cmsg), fds_to_send.data(), len);
+    }
+
+    return sendmsg(conn_fd, &msg, 0);
+}
+
 ssize_t receive_packet_with_fd(int conn_fd, void *packet, size_t packet_size, int &received_fd) {
     struct iovec iov{};
     iov.iov_base = packet;
@@ -64,6 +99,6 @@ ssize_t receive_packet_with_fd(int conn_fd, void *packet, size_t packet_size, in
     if (cmsg == nullptr) return -1;
     if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return -1;
 
-    received_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
     return n;
 }

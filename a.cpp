@@ -30,12 +30,6 @@ struct PublisherAttachment {
     int expected_seq = -1;
 };
 
-enum class SubscriberAttachmentState {
-    WaitingForPublisherCount,
-    WaitingForPublisherTopicShmFd,
-    WaitingForSubscriberEventFdAndSlot,
-};
-
 ssize_t receive_broker_packet(int broker_fd, char packet[], size_t packet_size, int &received_fd) {
     struct iovec iov{};
     iov.iov_base = packet;
@@ -162,6 +156,7 @@ void initialize_subscriber_read_index(PublisherAttachment &publisher_attachment)
 
 void consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
     SharedData *p = publisher_attachment.shared_data;
+
     uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
     while (wr > publisher_attachment.subscriber_read_index) {
         const size_t descriptor_count = static_cast<size_t>(wr - publisher_attachment.subscriber_read_index);
@@ -170,6 +165,171 @@ void consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
 
         read_data(publisher_attachment, desc_ring, descriptor_count);
         wr = p->descriptor_write_index.load(std::memory_order_acquire);
+    }
+}
+
+int epoll_fd = -1;
+int broker_fd = -1;
+
+unordered_map<int, PublisherAttachment> publisher_attachment_by_event_fd;
+unordered_map<AttachmentId, int> event_fd_by_attachment_id;
+
+void process_broker_control_messages() {
+    char packet[kMaxMessageSize];
+    char control[CMSG_SPACE(kMaxAttachmentsPerBatch * 2 * sizeof(int))];
+
+    struct iovec iov{};
+    iov.iov_base = packet;
+    iov.iov_len = kMaxMessageSize;
+
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+
+    while (true) {
+        msg.msg_controllen = sizeof(control);
+        msg.msg_flags = 0;
+
+        const ssize_t received_size = recvmsg(broker_fd, &msg, 0);
+
+        if (received_size == 0) {
+            cerr << "PublisherBrokerClosed: broker_fd=" << broker_fd << endl;
+            break;
+        } else if (received_size < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                cerr << "PublisherControlRecvError: broker_fd=" << broker_fd
+                     << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                exit(1);
+            }
+        } else if (msg.msg_flags & MSG_CTRUNC) {
+            cerr << "MsgTruncatedError\n";
+            exit(1);
+        }
+
+        size_t body_len = received_size - sizeof(BrokerMessageType);
+        BrokerMessageType message_type;
+        memcpy(&message_type, packet, sizeof(BrokerMessageType));
+
+        switch (message_type) {
+            case BrokerMessageType::SubscriberAttachmentBatch: {
+                /*
+                [type]
+                重复直到普通数据结束：
+                    [topic_id]
+                    [slot_index]
+
+                SCM_RIGHTS:
+                    [shm_fd_0, event_fd_0, shm_fd_1, event_fd_1, ...]
+                */
+
+                if (body_len % kSubscriberAttachmentMetadataSize != 0) {
+                    cerr << "SubscriberAttachmentBatchPayloadSizeError\n";
+                    exit(1);
+                }
+
+                const size_t attachment_count = body_len / kSubscriberAttachmentMetadataSize;
+
+                cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
+                if (attachment_count == 0) {
+                    if (cmsg != nullptr) {
+                        cerr << "SubscriberAttachmentBatchUnexpectedFdError\n";
+                        exit(1);
+                    }
+                    break;
+                }
+
+                if (is_valid_scm_rights_cmsg(cmsg) == false) {
+                    cerr << "SubscriberAttachmentBatchCmsgError\n";
+                    exit(1);
+                }
+
+                const size_t fd_data_size = cmsg->cmsg_len - CMSG_LEN(0);
+                if (fd_data_size % sizeof(int) != 0) {
+                    cerr << "SubscriberAttachmentBatchFdSizeError\n";
+                    exit(1);
+                }
+
+                const size_t fd_count = fd_data_size / sizeof(int);
+                if (fd_count != attachment_count * 2) {
+                    cerr << "SubscriberAttachmentBatchFdCountError\n";
+                    exit(1);
+                }
+
+                const int *fds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+
+                size_t packet_offset = sizeof(BrokerMessageType);
+
+                for (size_t attachment_index = 0; attachment_index < attachment_count; ++attachment_index) {
+                    AttachmentId attachment_id = kInvalidAttachmentId;
+                    memcpy(&attachment_id, packet + packet_offset, sizeof(AttachmentId));
+                    packet_offset += sizeof(AttachmentId);
+
+                    PublisherAttachment attachment;
+
+                    memcpy(&attachment.topic_id, packet + packet_offset, sizeof(attachment.topic_id));
+                    packet_offset += sizeof(attachment.topic_id);
+
+                    memcpy(&attachment.slot_index, packet + packet_offset, sizeof(attachment.slot_index));
+                    packet_offset += sizeof(attachment.slot_index);
+
+                    attachment.shm_fd = fds[2 * attachment_index];
+                    attachment.event_fd = fds[2 * attachment_index + 1];
+
+                    attachment.shared_data = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, attachment.shm_fd, 0));
+
+                    if (attachment.shared_data == MAP_FAILED) {
+                        cerr << "SubscriberAttachmentBatchMmapError\n";
+                        exit(1);
+                    }
+
+                    event_fd_by_attachment_id.insert({attachment_id, attachment.event_fd});
+
+                    add_fd_to_epoll(epoll_fd, attachment.event_fd);
+                    publisher_attachment_by_event_fd.insert({attachment.event_fd, std::move(attachment)});
+                }
+                break;
+            }
+            case BrokerMessageType::PublisherDisconnected: {
+                if (body_len != sizeof(AttachmentId)) {
+                    exit(1);
+                }
+
+                AttachmentId attachment_id = kInvalidAttachmentId;
+                memcpy(&attachment_id, packet + sizeof(BrokerMessageType), sizeof(attachment_id));
+
+                auto event_fd_it = event_fd_by_attachment_id.find(attachment_id);
+                if (event_fd_it == event_fd_by_attachment_id.end()) {
+                    exit(1);
+                }
+
+                int event_fd = event_fd_it->second;
+
+                auto publisher_attachment_it = publisher_attachment_by_event_fd.find(event_fd);
+                if (publisher_attachment_it == publisher_attachment_by_event_fd.end()) {
+                    exit(1);
+                }
+
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_fd, nullptr);
+                close(event_fd);
+
+                munmap(publisher_attachment_it->second.shared_data, sizeof(SharedData));
+                close(publisher_attachment_it->second.shm_fd);
+
+                event_fd_by_attachment_id.erase(event_fd_it);
+                publisher_attachment_by_event_fd.erase(publisher_attachment_it);
+                break;
+            }
+            default: {
+                cerr << "UnexpectedBrokerMessageTypeError: type="
+                     << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
+                     << ", bytes=" << received_size << ", broker_fd=" << broker_fd << endl;
+                exit(1);
+            }
+        }
     }
 }
 
@@ -184,7 +344,7 @@ int main(int argc, char *argv[]) {
 
     const string path = "/tmp/broker.sock";
 
-    int broker_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    broker_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -203,23 +363,19 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    PublisherAttachment pending_publisher_attachment;
-    unordered_map<int, PublisherAttachment> publisher_attachments_by_event_fd;
-    SubscriberAttachmentState subscriber_attachment_state = SubscriberAttachmentState::WaitingForPublisherCount;
-    uint32_t remaining_publisher_count = 0;
-
     char packet[kSubscriberTopicRegistrationMessageSize]{};
     packet[0] = static_cast<char>(BrokerMessageType::SubscriberTopicRegistration);
     memcpy(packet + sizeof(BrokerMessageType), &topic_count, sizeof(topic_count));
     for (uint32_t topic_index = 0; topic_index < topic_count; ++topic_index) {
         TopicId topic_id = static_cast<TopicId>(stoul(argv[topic_index + 1]));
         memcpy(packet + sizeof(BrokerMessageType) + sizeof(topic_count) + topic_index * sizeof(TopicId),
-            &topic_id, sizeof(topic_id));
+            &topic_id,
+            sizeof(topic_id));
     }
 
     send(broker_fd, packet, sizeof(packet), 0);
 
-    int epoll_fd = epoll_create1(0);
+    epoll_fd = epoll_create1(0);
     add_fd_to_epoll(epoll_fd, broker_fd);
 
     int maxevents = 1024;
@@ -232,8 +388,8 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < event_count; ++i) {
             int fd = events[i].data.fd;
             if (fd != broker_fd) {
-                auto publisher_attachment_it = publisher_attachments_by_event_fd.find(fd);
-                if (publisher_attachment_it == publisher_attachments_by_event_fd.end()) {
+                auto publisher_attachment_it = publisher_attachment_by_event_fd.find(fd);
+                if (publisher_attachment_it == publisher_attachment_by_event_fd.end()) {
                     cerr << "SubscriberEventFdAttachmentMissingError: event_fd=" << fd << endl;
                     return 1;
                 }
@@ -260,142 +416,14 @@ int main(int argc, char *argv[]) {
                 consume_contiguous_messages(publisher_attachment);
                 cout << "read over" << endl;
             } else if (fd == broker_fd) {
-                while (true) {
-                    char broker_packet[kMaxMessageSize];
-                    int received_fd;
-                    ssize_t received_size = receive_broker_packet(broker_fd, broker_packet, sizeof(broker_packet), received_fd);
-                    if (received_size == 0) {
-                        cerr << "SubscriberBrokerClosed: broker_fd=" << broker_fd << endl;
-                        return 1;
-                    }
-                    if (received_size < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-
-                        cerr << "SubscriberBrokerReceiveError: broker_fd=" << broker_fd
-                             << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
-                        return 1;
-                    }
-
-                    BrokerMessageType message_type = static_cast<BrokerMessageType>(broker_packet[0]);
-                    if (subscriber_attachment_state == SubscriberAttachmentState::WaitingForPublisherCount) {
-                        if (message_type != BrokerMessageType::SubscriberPublisherCount) {
-                            cerr << "SubscriberPublisherCountTypeError: expected="
-                                 << static_cast<unsigned>(BrokerMessageType::SubscriberPublisherCount)
-                                 << ", actual=" << static_cast<unsigned>(static_cast<unsigned char>(broker_packet[0]))
-                                 << ", broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-                        if (received_size != kSubscriberPublisherCountMessageSize) {
-                            cerr << "SubscriberPublisherCountMessageSizeError: expected="
-                                 << kSubscriberPublisherCountMessageSize
-                                 << ", actual=" << received_size
-                                 << ", broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-
-                        uint32_t publisher_count;
-                        memcpy(&publisher_count, broker_packet + sizeof(BrokerMessageType), sizeof(publisher_count));
-                        remaining_publisher_count = publisher_count;
-                        if (remaining_publisher_count > 0)
-                            subscriber_attachment_state = SubscriberAttachmentState::WaitingForPublisherTopicShmFd;
-                        continue;
-                    }
-
-                    if (subscriber_attachment_state == SubscriberAttachmentState::WaitingForPublisherTopicShmFd) {
-                        if (message_type != BrokerMessageType::PublisherTopicShmFd) {
-                            cerr << "SubscriberPublisherTopicShmFdTypeError: expected="
-                                 << static_cast<unsigned>(BrokerMessageType::PublisherTopicShmFd)
-                                 << ", actual=" << static_cast<unsigned>(static_cast<unsigned char>(broker_packet[0]))
-                                 << ", broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-                        if (received_size != kPublisherTopicShmFdMessageSize) {
-                            cerr << "SubscriberPublisherTopicShmFdMessageSizeError: expected="
-                                 << kPublisherTopicShmFdMessageSize << ", actual=" << received_size
-                                 << ", broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-                        if (received_fd < 0) {
-                            cerr << "SubscriberPublisherTopicShmFdMissingError: broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-
-                        pending_publisher_attachment = PublisherAttachment{};
-                        memcpy(&pending_publisher_attachment.topic_id,
-                            broker_packet + sizeof(BrokerMessageType),
-                            sizeof(pending_publisher_attachment.topic_id));
-                        pending_publisher_attachment.shm_fd = received_fd;
-                        pending_publisher_attachment.shared_data = reinterpret_cast<SharedData *>(mmap(nullptr,
-                            sizeof(SharedData),
-                            PROT_READ | PROT_WRITE,
-                            MAP_SHARED,
-                            pending_publisher_attachment.shm_fd,
-                            0));
-                        subscriber_attachment_state = SubscriberAttachmentState::WaitingForSubscriberEventFdAndSlot;
-                        continue;
-                    }
-
-                    if (subscriber_attachment_state == SubscriberAttachmentState::WaitingForSubscriberEventFdAndSlot) {
-                        if (message_type != BrokerMessageType::SubscriberEventFdAndSlot) {
-                            cerr << "SubscriberRegistrationResponseTypeError: expected="
-                                 << static_cast<unsigned>(BrokerMessageType::SubscriberEventFdAndSlot)
-                                 << ", actual=" << static_cast<unsigned>(static_cast<unsigned char>(broker_packet[0]))
-                                 << ", broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-                        if (received_size != kSubscriberEventFdAndSlotMessageSize) {
-                            cerr << "SubscriberRegisteredMessageSizeError: expected="
-                                 << kSubscriberEventFdAndSlotMessageSize
-                                 << ", actual=" << received_size
-                                 << ", broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-                        if (received_fd < 0) {
-                            cerr << "SubscriberRegisteredEventFdMissingError: broker_fd=" << broker_fd << endl;
-                            return 1;
-                        }
-
-                        pending_publisher_attachment.event_fd = received_fd;
-                        memcpy(&pending_publisher_attachment.slot_index,
-                            broker_packet + sizeof(BrokerMessageType),
-                            sizeof(pending_publisher_attachment.slot_index));
-                        auto [publisher_attachment_it, insert_success] = publisher_attachments_by_event_fd.emplace(
-                            pending_publisher_attachment.event_fd,
-                            pending_publisher_attachment);
-                        if (!insert_success) {
-                            cerr << "SubscriberEventFdAttachmentAlreadyExistsError: event_fd="
-                                 << pending_publisher_attachment.event_fd << endl;
-                            return 1;
-                        }
-                        PublisherAttachment &publisher_attachment = publisher_attachment_it->second;
-                        cout << "subscriber_slot_index is " << publisher_attachment.slot_index << endl;
-
-                        add_fd_to_epoll(epoll_fd, publisher_attachment.event_fd);
-                        --remaining_publisher_count;
-                        subscriber_attachment_state = remaining_publisher_count > 0
-                            ? SubscriberAttachmentState::WaitingForPublisherTopicShmFd
-                            : SubscriberAttachmentState::WaitingForPublisherCount;
-
-                        uint64_t val;
-                        ssize_t n = read(publisher_attachment.event_fd, &val, sizeof(val));
-                        if (n > 0) {
-                            initialize_subscriber_read_index(publisher_attachment);
-                            consume_contiguous_messages(publisher_attachment);
-                            cout << "read over" << endl;
-                        }
-                        continue;
-                    }
-
-                    cerr << "SubscriberAttachmentStateError: broker_fd=" << broker_fd << endl;
-                    return 1;
-                }
+                process_broker_control_messages();
             }
         }
         this_thread::sleep_for(chrono::milliseconds(1));
     }
 
 #ifdef ENABLE_DEBUG_CHECKS
-    for (auto &[event_fd, publisher_attachment] : publisher_attachments_by_event_fd) {
+    for (auto &[event_fd, publisher_attachment] : publisher_attachment_by_event_fd) {
         SharedData *p = publisher_attachment.shared_data;
         pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
@@ -414,7 +442,7 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    for (auto &[event_fd, publisher_attachment] : publisher_attachments_by_event_fd) {
+    for (auto &[event_fd, publisher_attachment] : publisher_attachment_by_event_fd) {
         munmap(publisher_attachment.shared_data, sizeof(SharedData));
         close(publisher_attachment.shm_fd);
         close(event_fd);

@@ -1,6 +1,6 @@
 CXX := g++
 CPPFLAGS := -Iinclude
-CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -pthread
+CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -pthread -DENABLE_DEBUG_CHECKS
 
 DEBUG_CHECKS ?= 0
 DEBUG_SYMBOLS ?= 0

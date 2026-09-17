@@ -58,9 +58,9 @@ optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) 
     BrokerMessageType message_type = static_cast<BrokerMessageType>(packet[0]);
     if (message_type != BrokerMessageType::SubscriberEventFdAndSlot) {
         cerr << "InitialSubscriberRegistrationTypeError: expected="
-                       << static_cast<unsigned>(BrokerMessageType::SubscriberEventFdAndSlot)
-                       << ", actual=" << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
-                       << ", bytes=" << ret << ", broker_fd=" << broker_fd << endl;
+             << static_cast<unsigned>(BrokerMessageType::SubscriberEventFdAndSlot)
+             << ", actual=" << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
+             << ", bytes=" << ret << ", broker_fd=" << broker_fd << endl;
         exit(1);
     }
     uint32_t received_subscriber_slot_index;
@@ -158,7 +158,7 @@ void release_chunk_references_in_descriptor_range(size_t start, size_t end, uint
                 // cout << "the " << chunk_index << " chunk free" << endl;
                 if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == false) {
                     cerr << "PublisherChunkDoubleFreeError: class=" << size_class
-                                   << ", index=" << chunk_index << ", offset=" << offset << endl;
+                         << ", index=" << chunk_index << ", offset=" << offset << endl;
                     pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
                     exit(1);
                 }
@@ -200,7 +200,7 @@ void reap_dead_subscribers(uint32_t slot_index) {
 void track_subscriber(SubscriberRegistration registration) {
     if (registration.slot_index >= kMaxSubscribers) {
         cerr << "PublisherSubscriberSlotRangeError: slot=" << registration.slot_index
-                       << ", max=" << kMaxSubscribers << ", event_fd=" << registration.event_fd << endl;
+             << ", max=" << kMaxSubscribers << ", event_fd=" << registration.event_fd << endl;
         exit(1);
     }
 
@@ -213,7 +213,7 @@ void track_subscriber(SubscriberRegistration registration) {
 
 int broker_fd;
 
-void process_broker_contorl_messages() {
+void process_broker_control_messages() {
     char packet[kMaxMessageSize];
     char control[CMSG_SPACE(sizeof(int))];
 
@@ -228,6 +228,7 @@ void process_broker_contorl_messages() {
 
     while (true) {
         msg.msg_controllen = sizeof(control);
+        msg.msg_flags = 0;
 
         const ssize_t received_size = recvmsg(broker_fd, &msg, 0);
 
@@ -239,20 +240,24 @@ void process_broker_contorl_messages() {
                 break;
             } else {
                 cerr << "PublisherControlRecvError: broker_fd=" << broker_fd
-                               << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                     << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
                 exit(1);
             }
+        } else if (msg.msg_flags & MSG_CTRUNC) {
+            cerr << "MsgTruncatedError\n";
+            exit(1);
         }
 
-        size_t body_len = received_size - 1;
-        auto message_type = static_cast<BrokerMessageType>(packet[0]);
+        size_t body_len = received_size - sizeof(BrokerMessageType);
+        BrokerMessageType message_type;
+        memcpy(&message_type, packet, sizeof(BrokerMessageType));
 
         switch (message_type) {
             case BrokerMessageType::SubscriberDisconnected: {
                 if (body_len != sizeof(uint32_t)) {
                     cerr << "SubscriberDisconnectPayloadSizeError: expected=" << sizeof(uint32_t)
-                                   << ", actual=" << body_len << ", packet=" << received_size
-                                   << ", broker_fd=" << broker_fd << endl;
+                         << ", actual=" << body_len << ", packet=" << received_size
+                         << ", broker_fd=" << broker_fd << endl;
                     exit(1);
                 }
 
@@ -264,8 +269,8 @@ void process_broker_contorl_messages() {
             case BrokerMessageType::SubscriberEventFdAndSlot: {
                 if (body_len != sizeof(uint32_t)) {
                     cerr << "SubscriberRegisteredPayloadSizeError: expected=" << sizeof(uint32_t)
-                                   << ", actual=" << body_len << ", packet=" << received_size
-                                   << ", broker_fd=" << broker_fd << endl;
+                         << ", actual=" << body_len << ", packet=" << received_size
+                         << ", broker_fd=" << broker_fd << endl;
                     exit(1);
                 }
 
@@ -280,8 +285,8 @@ void process_broker_contorl_messages() {
                 }
                 if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
                     cerr << "SubscriberRegisteredCmsgError: level=" << cmsg->cmsg_level
-                                   << ", type=" << cmsg->cmsg_type
-                                   << ", broker_fd=" << broker_fd << endl;
+                         << ", type=" << cmsg->cmsg_type
+                         << ", broker_fd=" << broker_fd << endl;
                     exit(1);
                 }
 
@@ -291,8 +296,8 @@ void process_broker_contorl_messages() {
             }
             default: {
                 cerr << "UnexpectedBrokerMessageTypeError: type="
-                               << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
-                               << ", bytes=" << received_size << ", broker_fd=" << broker_fd << endl;
+                     << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
+                     << ", bytes=" << received_size << ", broker_fd=" << broker_fd << endl;
                 exit(1);
             }
         }
@@ -302,10 +307,10 @@ void process_broker_contorl_messages() {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         cerr << "PublisherArgumentsError: usage=" << argv[0]
-                       << " <topic_id> <shm_name>" << endl;
+             << " <topic_id> <shm_name>" << endl;
         return 1;
     }
-    
+
     TopicId topic_id = static_cast<TopicId>(stoul(argv[1]));
     const char *shm_name = argv[2];
     shm_unlink(shm_name);
@@ -336,13 +341,13 @@ int main(int argc, char *argv[]) {
     }
     if (ret < 0) {
         cerr << "PublisherBrokerConnectError: attempts=" << fail_num
-                       << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+             << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
         return -1;
     }
 
     char packet[kPublisherTopicRegistrationMessageSize];
     packet[0] = static_cast<char>(BrokerMessageType::PublisherTopicRegistration);
-    
+
     memcpy(packet + sizeof(BrokerMessageType) / sizeof(char), &topic_id, sizeof(topic_id));
 
     send_packet_with_fd(broker_fd, packet, sizeof(packet), shm_fd);
@@ -352,7 +357,7 @@ int main(int argc, char *argv[]) {
         ssize_t n = recv(broker_fd, &subscriber_count, sizeof(subscriber_count), 0);
         if (n < 0) {
             cerr << "InitialSubscriberCountReceiveError: broker_fd=" << broker_fd
-                           << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                 << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
             return 1;
         }
         cout << "subscriber_count is " << subscriber_count << endl;
@@ -362,7 +367,7 @@ int main(int argc, char *argv[]) {
         auto registration = receive_subscriber_registration(broker_fd);
         if (!registration) {
             cerr << "ExistingSubscriberRegistrationReceiveError: index=" << i
-                           << ", broker_fd=" << broker_fd << endl;
+                 << ", broker_fd=" << broker_fd << endl;
             return 1;
         }
 
@@ -379,7 +384,7 @@ int main(int argc, char *argv[]) {
         int size_class = find_size_class(message_size_bytes);
         if (size_class < 0) {
             cerr << "PublisherMessageSizeClassError: seq=" << seq
-                           << ", size=" << message_size_bytes << endl;
+                 << ", size=" << message_size_bytes << endl;
             return 1;
         }
 
@@ -388,7 +393,7 @@ int main(int argc, char *argv[]) {
             (min_descriptor_read_index > wr && min_descriptor_read_index <= wr + 1) ||
             wr + 1 >= min_descriptor_read_index + kDescriptorSlotCount) {
             this_thread::sleep_for(chrono::milliseconds(50));
-            process_broker_contorl_messages();
+            process_broker_control_messages();
             min_descriptor_read_index = find_slowest_read_index();
             cout << "min_read_index == wr: min_read_index is " << min_descriptor_read_index << "  idx " << 1 << " read_index is " << p->descriptor_read_indices[0].load(memory_order_relaxed) << "   idx " << 2 << " read_index is " << p->descriptor_read_indices[1].load(memory_order_relaxed) << endl;
         }
@@ -401,7 +406,7 @@ int main(int argc, char *argv[]) {
         uint32_t tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
         while (head_off == tail_off) {
             this_thread::sleep_for(chrono::milliseconds(50));
-            process_broker_contorl_messages();
+            process_broker_control_messages();
             tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
             cout << "no node free" << endl;
             // 单写端不需要更新 head_off
@@ -411,7 +416,7 @@ int main(int argc, char *argv[]) {
         {
             if (head_off < kFirstOffset[size_class] || head_off > kLastOffset[size_class]) {
                 cerr << "PublisherChunkOffsetError: class=" << size_class
-                               << ", offset=" << head_off << endl;
+                     << ", offset=" << head_off << endl;
                 return -1;
             }
 
@@ -420,7 +425,7 @@ int main(int argc, char *argv[]) {
             size_t chunk_index = (head_off - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
             if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == true) {
                 cerr << "PublisherChunkAlreadyInUseError: class=" << size_class
-                               << ", index=" << chunk_index << ", offset=" << head_off << endl;
+                     << ", index=" << chunk_index << ", offset=" << head_off << endl;
                 pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
                 return 1;
             } else {
@@ -449,7 +454,7 @@ int main(int argc, char *argv[]) {
         uint32_t local_chunk_index = (head_off - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
         uint32_t chunk_index = kChunkIndexBaseBySizeClass[size_class] + local_chunk_index;
 
-        process_broker_contorl_messages();
+        process_broker_control_messages();
 
         uint32_t chunk_reference_mask = 0;
         for (size_t event_fd : event_fds) {
@@ -483,6 +488,7 @@ int main(int argc, char *argv[]) {
 
     munmap(p, sizeof(SharedData));
     close(shm_fd);
+    shm_unlink(shm_name);
 
     return 0;
 }
