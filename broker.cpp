@@ -3,13 +3,17 @@
 #include "include/shared_memory_layout_helpers.hpp"
 #include "include/fd_helpers.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <cstddef>
+#include <iomanip>
 #include <iostream>
 #include <queue>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -25,6 +29,31 @@
 #include <unordered_set>
 #include <vector>
 using namespace std;
+
+const char *get_topic_name_from_id(TopicId topic_id) {
+    switch (topic_id) {
+        case TopicId::Camera: return "Camera";
+        case TopicId::Lidar: return "Lidar";
+        case TopicId::VehicleState: return "VehicleState";
+        case TopicId::Invalid: return "Invalid";
+    }
+    return "Unknown";
+}
+
+const char *get_broker_role_name(BrokerRole role) {
+    switch (role) {
+        case BrokerRole::Subscriber: return "Subscriber";
+        case BrokerRole::Publisher: return "Publisher";
+    }
+    return "Unknown";
+}
+
+inline constexpr array<TopicId, 4> kKnownTopicIds{
+    TopicId::Camera,
+    TopicId::Lidar,
+    TopicId::VehicleState,
+    TopicId::Invalid,
+};
 
 AttachmentId next_attachment_id = 1;
 
@@ -102,6 +131,169 @@ std::unordered_map<TopicId, std::vector<int>> subscriber_fds_by_topic_id;
 
 std::unordered_set<int> client_fds;
 
+string format_topic_ids(const vector<TopicId> &topic_ids) {
+    if (topic_ids.empty()) return "-";
+
+    ostringstream text;
+    for (size_t topic_index = 0; topic_index < topic_ids.size(); ++topic_index) {
+        if (topic_index != 0) text << ',';
+        text << get_topic_name_from_id(topic_ids[topic_index]);
+    }
+    return text.str();
+}
+
+string format_fd_list(vector<int> fds) {
+    if (fds.empty()) return "-";
+
+    sort(fds.begin(), fds.end());
+    ostringstream text;
+    for (size_t fd_index = 0; fd_index < fds.size(); ++fd_index) {
+        if (fd_index != 0) text << ',';
+        text << fds[fd_index];
+    }
+    return text.str();
+}
+
+vector<TopicId> find_publisher_topic_ids(int publisher_fd) {
+    vector<TopicId> topic_ids;
+    for (TopicId topic_id : kKnownTopicIds) {
+        auto publishers_it = publisher_fds_by_topic_id.find(topic_id);
+        if (publishers_it != publisher_fds_by_topic_id.end() &&
+            find(publishers_it->second.begin(), publishers_it->second.end(), publisher_fd) != publishers_it->second.end()) {
+            topic_ids.emplace_back(topic_id);
+        }
+    }
+    return topic_ids;
+}
+
+string format_free_slots(AvailableSubscriberSlotMinHeap free_slots) {
+    if (free_slots.empty()) return "-";
+
+    ostringstream text;
+    bool first_slot = true;
+    while (!free_slots.empty()) {
+        if (!first_slot) text << ',';
+        text << free_slots.top();
+        free_slots.pop();
+        first_slot = false;
+    }
+    return text.str();
+}
+
+string format_occupied_slots(TopicId topic_id, int publisher_fd) {
+    vector<pair<uint32_t, int>> occupied_slots;
+    for (const auto &[subscriber_fd, attachments] : subscriber_attachments_by_subscriber_fd) {
+        for (const SubscriberAttachment &attachment : attachments) {
+            if (attachment.topic_id == topic_id && attachment.publisher_fd == publisher_fd) {
+                occupied_slots.emplace_back(attachment.slot_index, subscriber_fd);
+            }
+        }
+    }
+    if (occupied_slots.empty()) return "-";
+
+    sort(occupied_slots.begin(), occupied_slots.end());
+    ostringstream text;
+    for (size_t slot_index = 0; slot_index < occupied_slots.size(); ++slot_index) {
+        if (slot_index != 0) text << ',';
+        text << occupied_slots[slot_index].first << "->sub=" << occupied_slots[slot_index].second;
+    }
+    return text.str();
+}
+
+string build_status_snapshot_payload() {
+    ostringstream text;
+    text << "BROKER STATUS\n"
+         << "connection_state=registered_control_connection\n"
+         << "connection_count=" << role_by_fd.size() << "\n";
+
+    vector<int> connection_fds;
+    connection_fds.reserve(role_by_fd.size());
+    for (const auto &[fd, role] : role_by_fd) {
+        connection_fds.emplace_back(fd);
+    }
+    sort(connection_fds.begin(), connection_fds.end());
+
+    text << "\nCONNECTIONS\n"
+         << left << setw(6) << "FD"
+         << setw(12) << "ROLE"
+         << setw(13) << "STATE"
+         << setw(25) << "TOPICS"
+         << "ATTACHMENTS\n";
+    for (int fd : connection_fds) {
+        const BrokerRole role = role_by_fd.at(fd);
+        vector<TopicId> topic_ids;
+        string attachment_count = "-";
+
+        if (role == BrokerRole::Subscriber) {
+            auto topics_it = topic_ids_by_subscriber_fd.find(fd);
+            if (topics_it != topic_ids_by_subscriber_fd.end()) topic_ids = topics_it->second;
+
+            auto attachments_it = subscriber_attachments_by_subscriber_fd.find(fd);
+            attachment_count = attachments_it == subscriber_attachments_by_subscriber_fd.end()
+                ? "0"
+                : to_string(attachments_it->second.size());
+        } else if (role == BrokerRole::Publisher) {
+            topic_ids = find_publisher_topic_ids(fd);
+        }
+
+        text << left << setw(6) << fd
+             << setw(12) << get_broker_role_name(role)
+             << setw(13) << "registered"
+             << setw(25) << format_topic_ids(topic_ids)
+             << attachment_count << '\n';
+    }
+
+    text << "\nTOPIC ROUTING\n"
+         << left << setw(15) << "TOPIC"
+         << setw(25) << "PUBLISHERS"
+         << "SUBSCRIBERS\n";
+    for (TopicId topic_id : kKnownTopicIds) {
+        const auto publishers_it = publisher_fds_by_topic_id.find(topic_id);
+        const auto subscribers_it = subscriber_fds_by_topic_id.find(topic_id);
+        const vector<int> no_fds;
+        const vector<int> &publisher_fds = publishers_it == publisher_fds_by_topic_id.end()
+            ? no_fds
+            : publishers_it->second;
+        const vector<int> &subscriber_fds = subscribers_it == subscriber_fds_by_topic_id.end()
+            ? no_fds
+            : subscribers_it->second;
+
+        text << left << setw(15) << get_topic_name_from_id(topic_id)
+             << setw(25) << format_fd_list(publisher_fds)
+             << format_fd_list(subscriber_fds) << '\n';
+    }
+
+    text << "\nSLOTS\n"
+         << left << setw(15) << "TOPIC"
+         << setw(15) << "PUBLISHER_FD"
+         << setw(28) << "OCCUPIED"
+         << "FREE\n";
+    bool has_slot_rows = false;
+    for (TopicId topic_id : kKnownTopicIds) {
+        const auto slots_by_publisher_it = available_subscriber_slots_by_topic_id_and_publisher_fd.find(topic_id);
+        if (slots_by_publisher_it == available_subscriber_slots_by_topic_id_and_publisher_fd.end()) continue;
+
+        vector<int> publisher_fds;
+        publisher_fds.reserve(slots_by_publisher_it->second.size());
+        for (const auto &[publisher_fd, free_slots] : slots_by_publisher_it->second) {
+            publisher_fds.emplace_back(publisher_fd);
+        }
+        sort(publisher_fds.begin(), publisher_fds.end());
+
+        for (int publisher_fd : publisher_fds) {
+            const auto free_slots_it = slots_by_publisher_it->second.find(publisher_fd);
+            text << left << setw(15) << get_topic_name_from_id(topic_id)
+                 << setw(15) << publisher_fd
+                 << setw(28) << format_occupied_slots(topic_id, publisher_fd)
+                 << format_free_slots(free_slots_it->second) << '\n';
+            has_slot_rows = true;
+        }
+    }
+    if (!has_slot_rows) text << "-\n";
+
+    return text.str();
+}
+
 void handle_subsciber_disconect(int subscriber_fd) {
     auto subscriber_attachments_it = subscriber_attachments_by_subscriber_fd.find(subscriber_fd);
     if (subscriber_attachments_it == subscriber_attachments_by_subscriber_fd.end()) {
@@ -119,7 +311,9 @@ void handle_subsciber_disconect(int subscriber_fd) {
 
     for (const SubscriberAttachment &subscriber_attachment : subscriber_attachments_it->second) {
         char packet[kSubscriberDisconnectedMessageSize];
-        packet[0] = static_cast<char>(BrokerMessageType::SubscriberDisconnected);
+
+        const BrokerMessageType message_type = BrokerMessageType::SubscriberDisconnected;
+        memcpy(packet, &message_type, sizeof(BrokerMessageType));
         memcpy(packet + 1, &subscriber_attachment.slot_index, sizeof(subscriber_attachment.slot_index));
 
         ssize_t n = send(subscriber_attachment.publisher_fd, packet, kSubscriberDisconnectedMessageSize, 0);
@@ -422,192 +616,247 @@ int main() {
                         break;
                     }
 
-                    auto message_type = static_cast<BrokerMessageType>(packet[0]);
+                    bool current_fd_closed = false;
 
-                    if (message_type == BrokerMessageType::SubscriberTopicRegistration) {
-                        if (received_size != kSubscriberTopicRegistrationMessageSize) {
-                            cerr << "SubscriberTopicRegistrationMessageSizeError: expected="
-                                 << kSubscriberTopicRegistrationMessageSize
-                                 << ", actual=" << received_size << ", fd=" << fd << endl;
-                            exit(1);
-                        }
+                    BrokerMessageType message_type;
+                    memcpy(&message_type, packet, sizeof(BrokerMessageType));
 
-                        uint32_t topic_count;
-                        memcpy(&topic_count, packet + sizeof(BrokerMessageType), sizeof(topic_count));
-                        if (topic_count == 0 || topic_count > kMaxSubscriberTopicCount) {
-                            cerr << "SubscriberTopicRegistrationCountError: min=1, max="
-                                 << kMaxSubscriberTopicCount << ", actual=" << topic_count
-                                 << ", fd=" << fd << endl;
-                            exit(1);
-                        }
-
-                        vector<TopicId> topic_ids;
-                        topic_ids.reserve(topic_count);
-                        for (uint32_t topic_index = 0; topic_index < topic_count; ++topic_index) {
-                            TopicId topic_id;
-                            memcpy(&topic_id,
-                                packet + sizeof(BrokerMessageType) + sizeof(topic_count) + topic_index * sizeof(TopicId),
-                                sizeof(topic_id));
-                            topic_ids.emplace_back(topic_id);
-                        }
-                        topic_ids_by_subscriber_fd.insert({fd, topic_ids});
-
-                        role_by_fd.insert({fd, BrokerRole::Subscriber});
-
-                        vector<SubscriberAttachment> subscriber_attachments;
-                        vector<int> shm_fds;
-
-                        for (TopicId topic_id : topic_ids) {
-                            auto topic_publishers_it = publisher_fds_by_topic_id.find(topic_id);
-                            uint32_t publisher_count = topic_publishers_it == publisher_fds_by_topic_id.end()
-                                ? 0
-                                : static_cast<uint32_t>(topic_publishers_it->second.size());
-
-                            subscriber_fds_by_topic_id[topic_id].emplace_back(fd);
-
-                            if (topic_publishers_it == publisher_fds_by_topic_id.end()) continue;
-
-                            auto available_subscriber_slots_by_topic_id_it = available_subscriber_slots_by_topic_id_and_publisher_fd.find(topic_id);
-                            if (available_subscriber_slots_by_topic_id_it == available_subscriber_slots_by_topic_id_and_publisher_fd.end()) {
-                                cerr << "SubscriberTopicAvailableTopicMapMissingError: topic="
-                                     << static_cast<unsigned>(topic_id) << endl;
+                    switch (message_type) {
+                        case BrokerMessageType::StatusQuery: {
+                            if (received_size != kStatusQuerySize) {
                                 exit(1);
                             }
 
-                            subscriber_attachments.reserve(subscriber_attachments.size() + publisher_count);
-                            for (int publisher_fd : topic_publishers_it->second) {
-                                auto shm_it = shm_fd_by_publisher_fd.find(publisher_fd);
-                                if (shm_it == shm_fd_by_publisher_fd.end()) {
-                                    cerr << "SubscriberTopicShmFdMapMissingError: topic="
-                                         << static_cast<unsigned>(topic_id) << ", publisher_fd=" << publisher_fd << endl;
-                                    exit(1);
-                                }
-                                int shm_fd = shm_it->second;
+                            string payload = build_status_snapshot_payload();
+                            if (payload.size() > kMaxStatusSnapshotPayloadSize) {
+                                payload = "complete=0\nreason=status_snapshot_too_large\n";
+                            }
 
-                                auto available_subscriber_slots_by_publisher_fd_it = available_subscriber_slots_by_topic_id_it->second.find(publisher_fd);
-                                if (available_subscriber_slots_by_publisher_fd_it == available_subscriber_slots_by_topic_id_it->second.end()) {
-                                    cerr << "SubscriberTopicAvailablePublisherMapMissingError: topic="
-                                         << static_cast<unsigned>(topic_id) << ", publisher_fd=" << publisher_fd << endl;
-                                    exit(1);
-                                }
-                                auto &available_subscriber_slots = available_subscriber_slots_by_publisher_fd_it->second;
-                                if (available_subscriber_slots.empty()) {
-                                    cerr << "BrokerNoFreeSubscriberSlotError: topic="
-                                         << static_cast<unsigned>(topic_id)
-                                         << ", publisher_fd=" << publisher_fd << endl;
-                                    exit(1);
-                                }
-                                int event_fd = eventfd(0, EFD_NONBLOCK);
-                                uint32_t slot_index = available_subscriber_slots.top();
-                                available_subscriber_slots.pop();
+                            char sent_type = static_cast<char>(BrokerMessageType::StatusSnapshot);
 
-                                send_subscriber_registered_message(publisher_fd, event_fd, slot_index);
+                            array<iovec, 2> iov{};
+                            iov[0].iov_base = &sent_type;
+                            iov[0].iov_len = sizeof(sent_type);
 
-                                shm_fds.emplace_back(shm_fd);
-                                subscriber_attachments.emplace_back(
-                                    SubscriberAttachment{next_attachment_id++, topic_id, publisher_fd, event_fd, slot_index});
+                            iov[1].iov_base = payload.data();
+                            iov[1].iov_len = payload.size();
 
-                                if (next_attachment_id == kInvalidAttachmentId) {
-                                    exit(1);
+                            msghdr msg{};
+                            msg.msg_iov = iov.data();
+                            msg.msg_iovlen = iov.size();
+
+                            const size_t expected_size = sizeof(sent_type) + payload.size();
+                            const ssize_t sent_size = sendmsg(fd, &msg, 0);
+                            if (sent_size != static_cast<ssize_t>(expected_size)) {
+                                if (sent_size < 0) {
+                                    cerr << "BrokerStatusSnapshotSendError: fd=" << fd
+                                         << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                                } else {
+                                    cerr << "BrokerStatusSnapshotSendSizeError: fd=" << fd
+                                         << ", expected=" << sizeof(expected_size) << ", actual=" << sent_size << endl;
                                 }
                             }
+
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                            client_fds.erase(fd);
+                            close(fd);
+
+                            current_fd_closed = true;
+
+                            break;
                         }
-
-                        ssize_t n = send_subscriber_attachment_batch_message(fd, subscriber_attachments, shm_fds);
-                        if (n < 0) {
-                            exit(1);
-                        }
-
-                        if (!subscriber_attachments.empty())
-                            cout << "send fd and subscriber_slot_index" << endl;
-
-                        subscriber_attachments_by_subscriber_fd.insert({fd, std::move(subscriber_attachments)});
-                    } else if (message_type == BrokerMessageType::PublisherTopicRegistration) {
-                        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-
-                        if (cmsg == nullptr) {
-                            cerr << "PublisherRegistrationShmFdMissingError: fd="
-                                 << fd << endl;
-                            exit(1);
-                        }
-                        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-                            cerr << "PublisherRegistrationCmsgError: level="
-                                 << cmsg->cmsg_level << ", type=" << cmsg->cmsg_type
-                                 << ", fd=" << fd << endl;
-                            exit(1);
-                        }
-
-                        int shm_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
-                        shm_fd_by_publisher_fd.insert({fd, shm_fd});
-
-                        TopicId topic_id;
-                        memcpy(&topic_id, packet + sizeof(BrokerMessageType) / sizeof(char), sizeof(topic_id));
-
-                        auto &available_subscriber_slots_by_publisher_fd =
-                            available_subscriber_slots_by_topic_id_and_publisher_fd[topic_id];
-                        auto [available_subscriber_slots_by_publisher_fd_it, insert_success] =
-                            available_subscriber_slots_by_publisher_fd.insert({fd, {}});
-                        if (!insert_success) {
-                            cerr << "PublisherSlotIndexHeapAlreadyExistsError: topic="
-                                 << static_cast<unsigned>(topic_id) << ", fd=" << fd << endl;
-                            exit(1);
-                        }
-                        AvailableSubscriberSlotMinHeap &available_subscriber_slots =
-                            available_subscriber_slots_by_publisher_fd_it->second;
-                        init_available_subscriber_slots(available_subscriber_slots);
-
-                        role_by_fd.insert({fd, BrokerRole::Publisher});
-
-                        auto topic_subscribers_it = subscriber_fds_by_topic_id.find(topic_id);
-                        size_t subscriber_count = topic_subscribers_it == subscriber_fds_by_topic_id.end()
-                            ? 0
-                            : topic_subscribers_it->second.size();
-                        if (subscriber_count > available_subscriber_slots.size()) {
-                            cerr << "BrokerSubscriberSlotCapacityError: topic="
-                                 << static_cast<unsigned>(topic_id)
-                                 << ", subscriber_count=" << subscriber_count
-                                 << ", available=" << available_subscriber_slots.size() << endl;
-                            exit(1);
-                        }
-
-                        uint32_t registered_subscriber_count = static_cast<uint32_t>(subscriber_count);
-                        ssize_t n = send(fd, &registered_subscriber_count, sizeof(registered_subscriber_count), 0);
-                        if (n < 0) {
-                            cerr << "InitialSubscriberCountSendError: fd=" << fd
-                                 << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
-                            return 1;
-                        }
-
-                        if (topic_subscribers_it != subscriber_fds_by_topic_id.end()) {
-                            for (int subscriber_fd : topic_subscribers_it->second) {
-                                int event_fd = eventfd(0, EFD_NONBLOCK);
-                                uint32_t slot_index = available_subscriber_slots.top();
-                                available_subscriber_slots.pop();
-
-                                send_subscriber_registered_message(fd, event_fd, slot_index);
-
-                                SubscriberAttachment attachment{next_attachment_id++, topic_id, fd, event_fd, slot_index};
-                                if (next_attachment_id == kInvalidAttachmentId) {
-                                    exit(1);
-                                }
-
-                                ssize_t subscriber_batch_send_result = send_subscriber_attachment_batch_message(subscriber_fd, {attachment}, {shm_fd});
-                                if (subscriber_batch_send_result < 0) {
-                                    exit(1);
-                                }
-
-                                auto subscriber_attachments_it = subscriber_attachments_by_subscriber_fd.find(subscriber_fd);
-                                if (subscriber_attachments_it == subscriber_attachments_by_subscriber_fd.end()) {
-                                    cerr << "PublisherRegistrationSubscriberAttachmentsMissingError: topic="
-                                         << static_cast<unsigned>(topic_id)
-                                         << ", subscriber_fd=" << subscriber_fd << endl;
-                                    exit(1);
-                                }
-                                subscriber_attachments_it->second.emplace_back(std::move(attachment));
+                        case BrokerMessageType::SubscriberTopicRegistration: {
+                            if (received_size != kSubscriberTopicRegistrationMessageSize) {
+                                cerr << "SubscriberTopicRegistrationMessageSizeError: expected="
+                                     << kSubscriberTopicRegistrationMessageSize
+                                     << ", actual=" << received_size << ", fd=" << fd << endl;
+                                exit(1);
                             }
+
+                            uint32_t topic_count;
+                            memcpy(&topic_count, packet + sizeof(BrokerMessageType), sizeof(topic_count));
+                            if (topic_count == 0 || topic_count > kMaxSubscriberTopicCount) {
+                                cerr << "SubscriberTopicRegistrationCountError: min=1, max="
+                                     << kMaxSubscriberTopicCount << ", actual=" << topic_count
+                                     << ", fd=" << fd << endl;
+                                exit(1);
+                            }
+
+                            vector<TopicId> topic_ids;
+                            topic_ids.reserve(topic_count);
+                            for (uint32_t topic_index = 0; topic_index < topic_count; ++topic_index) {
+                                TopicId topic_id;
+                                memcpy(&topic_id,
+                                    packet + sizeof(BrokerMessageType) + sizeof(topic_count) + topic_index * sizeof(TopicId),
+                                    sizeof(topic_id));
+                                topic_ids.emplace_back(topic_id);
+                            }
+                            topic_ids_by_subscriber_fd.insert({fd, topic_ids});
+
+                            role_by_fd.insert({fd, BrokerRole::Subscriber});
+
+                            vector<SubscriberAttachment> subscriber_attachments;
+                            vector<int> shm_fds;
+
+                            for (TopicId topic_id : topic_ids) {
+                                auto topic_publishers_it = publisher_fds_by_topic_id.find(topic_id);
+                                uint32_t publisher_count = topic_publishers_it == publisher_fds_by_topic_id.end()
+                                    ? 0
+                                    : static_cast<uint32_t>(topic_publishers_it->second.size());
+
+                                subscriber_fds_by_topic_id[topic_id].emplace_back(fd);
+
+                                if (topic_publishers_it == publisher_fds_by_topic_id.end()) continue;
+
+                                auto available_subscriber_slots_by_topic_id_it = available_subscriber_slots_by_topic_id_and_publisher_fd.find(topic_id);
+                                if (available_subscriber_slots_by_topic_id_it == available_subscriber_slots_by_topic_id_and_publisher_fd.end()) {
+                                    cerr << "SubscriberTopicAvailableTopicMapMissingError: topic="
+                                         << static_cast<unsigned>(topic_id) << endl;
+                                    exit(1);
+                                }
+
+                                subscriber_attachments.reserve(subscriber_attachments.size() + publisher_count);
+                                for (int publisher_fd : topic_publishers_it->second) {
+                                    auto shm_it = shm_fd_by_publisher_fd.find(publisher_fd);
+                                    if (shm_it == shm_fd_by_publisher_fd.end()) {
+                                        cerr << "SubscriberTopicShmFdMapMissingError: topic="
+                                             << static_cast<unsigned>(topic_id) << ", publisher_fd=" << publisher_fd << endl;
+                                        exit(1);
+                                    }
+                                    int shm_fd = shm_it->second;
+
+                                    auto available_subscriber_slots_by_publisher_fd_it = available_subscriber_slots_by_topic_id_it->second.find(publisher_fd);
+                                    if (available_subscriber_slots_by_publisher_fd_it == available_subscriber_slots_by_topic_id_it->second.end()) {
+                                        cerr << "SubscriberTopicAvailablePublisherMapMissingError: topic="
+                                             << static_cast<unsigned>(topic_id) << ", publisher_fd=" << publisher_fd << endl;
+                                        exit(1);
+                                    }
+                                    auto &available_subscriber_slots = available_subscriber_slots_by_publisher_fd_it->second;
+                                    if (available_subscriber_slots.empty()) {
+                                        cerr << "BrokerNoFreeSubscriberSlotError: topic="
+                                             << static_cast<unsigned>(topic_id)
+                                             << ", publisher_fd=" << publisher_fd << endl;
+                                        exit(1);
+                                    }
+                                    int event_fd = eventfd(0, EFD_NONBLOCK);
+                                    uint32_t slot_index = available_subscriber_slots.top();
+                                    available_subscriber_slots.pop();
+
+                                    send_subscriber_registered_message(publisher_fd, event_fd, slot_index);
+
+                                    shm_fds.emplace_back(shm_fd);
+                                    subscriber_attachments.emplace_back(
+                                        SubscriberAttachment{next_attachment_id++, topic_id, publisher_fd, event_fd, slot_index});
+
+                                    if (next_attachment_id == kInvalidAttachmentId) {
+                                        exit(1);
+                                    }
+                                }
+                            }
+
+                            ssize_t n = send_subscriber_attachment_batch_message(fd, subscriber_attachments, shm_fds);
+                            if (n < 0) {
+                                exit(1);
+                            }
+
+                            if (!subscriber_attachments.empty())
+                                cout << "send fd and subscriber_slot_index" << endl;
+
+                            subscriber_attachments_by_subscriber_fd.insert({fd, std::move(subscriber_attachments)});
+                            break;
                         }
-                        publisher_fds_by_topic_id[topic_id].emplace_back(fd);
+                        case BrokerMessageType::PublisherTopicRegistration: {
+                            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
+                            if (cmsg == nullptr) {
+                                cerr << "PublisherRegistrationShmFdMissingError: fd="
+                                     << fd << endl;
+                                exit(1);
+                            }
+                            if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+                                cerr << "PublisherRegistrationCmsgError: level="
+                                     << cmsg->cmsg_level << ", type=" << cmsg->cmsg_type
+                                     << ", fd=" << fd << endl;
+                                exit(1);
+                            }
+
+                            int shm_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+                            shm_fd_by_publisher_fd.insert({fd, shm_fd});
+
+                            TopicId topic_id;
+                            memcpy(&topic_id, packet + sizeof(BrokerMessageType) / sizeof(char), sizeof(topic_id));
+
+                            auto &available_subscriber_slots_by_publisher_fd =
+                                available_subscriber_slots_by_topic_id_and_publisher_fd[topic_id];
+                            auto [available_subscriber_slots_by_publisher_fd_it, insert_success] =
+                                available_subscriber_slots_by_publisher_fd.insert({fd, {}});
+                            if (!insert_success) {
+                                cerr << "PublisherSlotIndexHeapAlreadyExistsError: topic="
+                                     << static_cast<unsigned>(topic_id) << ", fd=" << fd << endl;
+                                exit(1);
+                            }
+                            AvailableSubscriberSlotMinHeap &available_subscriber_slots =
+                                available_subscriber_slots_by_publisher_fd_it->second;
+                            init_available_subscriber_slots(available_subscriber_slots);
+
+                            role_by_fd.insert({fd, BrokerRole::Publisher});
+
+                            auto topic_subscribers_it = subscriber_fds_by_topic_id.find(topic_id);
+                            size_t subscriber_count = topic_subscribers_it == subscriber_fds_by_topic_id.end()
+                                ? 0
+                                : topic_subscribers_it->second.size();
+                            if (subscriber_count > available_subscriber_slots.size()) {
+                                cerr << "BrokerSubscriberSlotCapacityError: topic="
+                                     << static_cast<unsigned>(topic_id)
+                                     << ", subscriber_count=" << subscriber_count
+                                     << ", available=" << available_subscriber_slots.size() << endl;
+                                exit(1);
+                            }
+
+                            uint32_t registered_subscriber_count = static_cast<uint32_t>(subscriber_count);
+                            ssize_t n = send(fd, &registered_subscriber_count, sizeof(registered_subscriber_count), 0);
+                            if (n < 0) {
+                                cerr << "InitialSubscriberCountSendError: fd=" << fd
+                                     << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                                return 1;
+                            }
+
+                            if (topic_subscribers_it != subscriber_fds_by_topic_id.end()) {
+                                for (int subscriber_fd : topic_subscribers_it->second) {
+                                    int event_fd = eventfd(0, EFD_NONBLOCK);
+                                    uint32_t slot_index = available_subscriber_slots.top();
+                                    available_subscriber_slots.pop();
+
+                                    send_subscriber_registered_message(fd, event_fd, slot_index);
+
+                                    SubscriberAttachment attachment{next_attachment_id++, topic_id, fd, event_fd, slot_index};
+                                    if (next_attachment_id == kInvalidAttachmentId) {
+                                        exit(1);
+                                    }
+
+                                    ssize_t subscriber_batch_send_result = send_subscriber_attachment_batch_message(subscriber_fd, {attachment}, {shm_fd});
+                                    if (subscriber_batch_send_result < 0) {
+                                        exit(1);
+                                    }
+
+                                    auto subscriber_attachments_it = subscriber_attachments_by_subscriber_fd.find(subscriber_fd);
+                                    if (subscriber_attachments_it == subscriber_attachments_by_subscriber_fd.end()) {
+                                        cerr << "PublisherRegistrationSubscriberAttachmentsMissingError: topic="
+                                             << static_cast<unsigned>(topic_id)
+                                             << ", subscriber_fd=" << subscriber_fd << endl;
+                                        exit(1);
+                                    }
+                                    subscriber_attachments_it->second.emplace_back(std::move(attachment));
+                                }
+                            }
+                            publisher_fds_by_topic_id[topic_id].emplace_back(fd);
+                        }
+                        default: {
+                            break;
+                        }
                     }
+
+                    if (current_fd_closed) break;
                 }
             }
         }

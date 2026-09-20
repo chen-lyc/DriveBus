@@ -14,7 +14,7 @@ CPPFLAGS += -DENABLE_DEBUG_CHECKS
 endif
 
 HEADERS := $(wildcard include/*.h include/*.hpp)
-TARGETS := a.out b.out broker.out
+TARGETS := a.out b.out broker.out broker-status
 
 .PHONY: all rebuild
 
@@ -33,3 +33,6 @@ b.out: b.cpp src/fd_helpers.cpp $(HEADERS)
 
 broker.out: broker.cpp src/fd_helpers.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker.cpp src/fd_helpers.cpp -o $@
+
+broker-status: broker_status_cli.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker_status_cli.cpp -o $@
