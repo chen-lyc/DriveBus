@@ -1,3 +1,4 @@
+#include "include/logger.h"
 #include "include/broker_protocol.hpp"
 #include "include/shared_memory_layout.hpp"
 #include "include/shared_memory_layout_helpers.hpp"
@@ -19,6 +20,16 @@
 #include <stdint.h>
 #include <unordered_map>
 using namespace std;
+
+std::filesystem::path subscriber_log_path(const std::string &run_id) {
+    const auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    return std::filesystem::path("logs") /
+        run_id /
+        "subscriber" /
+        ("pid-" + std::to_string(getpid()) +
+            "-start-" + std::to_string(start_us) + ".log");
+}
 
 struct PublisherAttachment {
     TopicId topic_id = TopicId::Invalid;
@@ -60,7 +71,7 @@ ssize_t receive_broker_packet(int broker_fd, char packet[], size_t packet_size, 
     return received_size;
 }
 
-void read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc_ring[], const size_t descriptor_count) {
+bool read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc_ring[], const size_t descriptor_count) {
     SharedData *p = publisher_attachment.shared_data;
     for (size_t descriptor_index = 0; descriptor_index < descriptor_count; ++descriptor_index) {
         uint32_t offset = desc_ring[descriptor_index].offset;
@@ -68,33 +79,34 @@ void read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc
 
         int size_class = find_size_class(message_size_bytes);
         if (size_class < 0) {
-            cerr << "SubscriberMessageSizeClassError: seq=" << publisher_attachment.expected_seq
-                 << ", descriptor=" << descriptor_index
-                 << ", size=" << message_size_bytes << endl;
-            exit(1);
+            LOG_FATAL("SubscriberMessageSizeClassError: seq=%d, descriptor=%zu, size=%u",
+                publisher_attachment.expected_seq,
+                descriptor_index,
+                message_size_bytes);
+            return false;
         }
 
         int magic, seq;
         memcpy(&magic, p->data + offset, sizeof(int));
         memcpy(&seq, p->data + offset + sizeof(int), sizeof(int));
-        cout << "read " << message_size_bytes << " byte, offset is " << offset << ", seq is " << seq << endl;
+        LOG_DEBUG("read bytes=%u offset=%u seq=%d", message_size_bytes, offset, seq);
 
         if (publisher_attachment.expected_seq == -1) publisher_attachment.expected_seq = seq;
 
         bool is_error = false;
         if (magic != kMagic) {
-            cerr << "SubscriberChunkMagicError: expected=" << kMagic
-                 << ", actual=" << magic << ", descriptor=" << descriptor_index
-                 << ", offset=" << offset << endl;
+            LOG_FATAL("shared-memory magic mismatch: expected=%d actual=%d",
+                kMagic,
+                magic);
             is_error = true;
         }
         if (seq != publisher_attachment.expected_seq) {
-            cerr << "SubscriberSequenceError: expected=" << publisher_attachment.expected_seq
-                 << ", actual=" << seq << ", descriptor=" << descriptor_index
-                 << ", offset=" << offset << endl;
+            LOG_FATAL("shared-memory seq mismatch: expected=%d actual=%d",
+                publisher_attachment.expected_seq,
+                seq);
             is_error = true;
         }
-        if (is_error) exit(1);
+        if (is_error) return false;
         if (message_size_bytes > 2 * sizeof(int)) {
             write(1, p->data + offset + 2 * sizeof(int), message_size_bytes - 2 * sizeof(int));
         }
@@ -104,10 +116,8 @@ void read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc
 
 #ifdef ENABLE_DEBUG_CHECKS
         if (offset < kFirstOffset[size_class] || offset > kLastOffset[size_class]) {
-            cerr << "SubscriberChunkOffsetError: class=" << size_class
-                 << ", offset=" << offset << endl;
-            pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
-            exit(1);
+            LOG_FATAL("SubscriberChunkOffsetError: class=%d, offset=%u", size_class, offset);
+            return false;
         }
 #endif
 
@@ -119,7 +129,7 @@ void read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc
         if (++publisher_attachment.subscriber_read_index >= kDescriptorSlotCount)
             publisher_attachment.subscriber_read_index %= kDescriptorSlotCount;
         p->descriptor_read_indices[publisher_attachment.slot_index].store(publisher_attachment.subscriber_read_index, std::memory_order_release);
-        cout << "subscriber_read_index is " << publisher_attachment.subscriber_read_index << endl;
+        LOG_DEBUG("subscriber_read_index is %u", publisher_attachment.subscriber_read_index);
 
         if (previous_reference_count == subscriber_reference_bit) {
 #ifdef ENABLE_DEBUG_CHECKS
@@ -127,12 +137,14 @@ void read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc
                 pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
                 size_t chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
-                cout << "the " << chunk_index << " chunk free" << endl;
+                LOG_DEBUG("the %zu chunk free", chunk_index);
                 if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == false) {
-                    cerr << "SubscriberChunkDoubleFreeError: class=" << size_class
-                         << ", index=" << chunk_index << ", offset=" << offset << endl;
+                    LOG_FATAL("SubscriberChunkDoubleFreeError: class=%d, index=%zu, offset=%u",
+                        size_class,
+                        chunk_index,
+                        offset);
                     pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
-                    exit(1);
+                    return false;
                 }
                 p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = false;
 
@@ -145,6 +157,7 @@ void read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc
             p->tail.offset[size_class].store(offset, std::memory_order_release);
         }
     }
+    return true;
 }
 
 void initialize_subscriber_read_index(PublisherAttachment &publisher_attachment) {
@@ -154,7 +167,7 @@ void initialize_subscriber_read_index(PublisherAttachment &publisher_attachment)
                                                          .load(memory_order_relaxed);
 }
 
-void consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
+bool consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
     SharedData *p = publisher_attachment.shared_data;
 
     uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
@@ -163,9 +176,12 @@ void consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
         MessageDescriptor desc_ring[descriptor_count];
         copy(p->desc_ring + publisher_attachment.subscriber_read_index, p->desc_ring + wr, desc_ring);
 
-        read_data(publisher_attachment, desc_ring, descriptor_count);
+        if (!read_data(publisher_attachment, desc_ring, descriptor_count)) {
+            return false;
+        }
         wr = p->descriptor_write_index.load(std::memory_order_acquire);
     }
+    return true;
 }
 
 int epoll_fd = -1;
@@ -174,7 +190,7 @@ int broker_fd = -1;
 unordered_map<int, PublisherAttachment> publisher_attachment_by_event_fd;
 unordered_map<AttachmentId, int> event_fd_by_attachment_id;
 
-void process_broker_control_messages() {
+bool process_broker_control_messages() {
     char packet[kMaxMessageSize];
     char control[CMSG_SPACE(kMaxAttachmentsPerBatch * 2 * sizeof(int))];
 
@@ -194,19 +210,18 @@ void process_broker_control_messages() {
         const ssize_t received_size = recvmsg(broker_fd, &msg, 0);
 
         if (received_size == 0) {
-            cerr << "PublisherBrokerClosed: broker_fd=" << broker_fd << endl;
-            break;
+            LOG_ERROR("broker control connection closed: broker_fd=%d", broker_fd);
+            return false;
         } else if (received_size < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
-                cerr << "PublisherControlRecvError: broker_fd=" << broker_fd
-                     << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
-                exit(1);
+                LOG_ERROR("broker control recv failed: fd=%d errno=%d (%s)", broker_fd, errno, strerror(errno));
+                return false;
             }
         } else if (msg.msg_flags & MSG_CTRUNC) {
-            cerr << "MsgTruncatedError\n";
-            exit(1);
+            LOG_FATAL("MsgTruncatedError");
+            return false;
         }
 
         size_t body_len = received_size - sizeof(BrokerMessageType);
@@ -226,8 +241,8 @@ void process_broker_control_messages() {
                 */
 
                 if (body_len % kSubscriberAttachmentMetadataSize != 0) {
-                    cerr << "SubscriberAttachmentBatchPayloadSizeError\n";
-                    exit(1);
+                    LOG_FATAL("SubscriberAttachmentBatchPayloadSizeError");
+                    return false;
                 }
 
                 const size_t attachment_count = body_len / kSubscriberAttachmentMetadataSize;
@@ -236,27 +251,27 @@ void process_broker_control_messages() {
 
                 if (attachment_count == 0) {
                     if (cmsg != nullptr) {
-                        cerr << "SubscriberAttachmentBatchUnexpectedFdError\n";
-                        exit(1);
+                        LOG_FATAL("SubscriberAttachmentBatchUnexpectedFdError");
+                        return false;
                     }
                     break;
                 }
 
                 if (is_valid_scm_rights_cmsg(cmsg) == false) {
-                    cerr << "SubscriberAttachmentBatchCmsgError\n";
-                    exit(1);
+                    LOG_FATAL("SubscriberAttachmentBatchCmsgError");
+                    return false;
                 }
 
                 const size_t fd_data_size = cmsg->cmsg_len - CMSG_LEN(0);
                 if (fd_data_size % sizeof(int) != 0) {
-                    cerr << "SubscriberAttachmentBatchFdSizeError\n";
-                    exit(1);
+                    LOG_FATAL("SubscriberAttachmentBatchFdSizeError");
+                    return false;
                 }
 
                 const size_t fd_count = fd_data_size / sizeof(int);
                 if (fd_count != attachment_count * 2) {
-                    cerr << "SubscriberAttachmentBatchFdCountError\n";
-                    exit(1);
+                    LOG_FATAL("SubscriberAttachmentBatchFdCountError");
+                    return false;
                 }
 
                 const int *fds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
@@ -282,8 +297,8 @@ void process_broker_control_messages() {
                     attachment.shared_data = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, attachment.shm_fd, 0));
 
                     if (attachment.shared_data == MAP_FAILED) {
-                        cerr << "SubscriberAttachmentBatchMmapError\n";
-                        exit(1);
+                        LOG_ERROR("SubscriberAttachmentBatchMmapError");
+                        return false;
                     }
 
                     event_fd_by_attachment_id.insert({attachment_id, attachment.event_fd});
@@ -291,11 +306,15 @@ void process_broker_control_messages() {
                     add_fd_to_epoll(epoll_fd, attachment.event_fd);
                     publisher_attachment_by_event_fd.insert({attachment.event_fd, std::move(attachment)});
                 }
+
+                LOG_INFO("subscriber attachment batch installed: count=%zu",
+                    attachment_count);
                 break;
             }
             case BrokerMessageType::PublisherDisconnected: {
                 if (body_len != sizeof(AttachmentId)) {
-                    exit(1);
+                    LOG_FATAL("PublisherDisconnectedPayloadSizeError: bytes=%zu", body_len);
+                    return false;
                 }
 
                 AttachmentId attachment_id = kInvalidAttachmentId;
@@ -303,14 +322,19 @@ void process_broker_control_messages() {
 
                 auto event_fd_it = event_fd_by_attachment_id.find(attachment_id);
                 if (event_fd_it == event_fd_by_attachment_id.end()) {
-                    exit(1);
+                    LOG_FATAL("PublisherDisconnectedAttachmentMissingError: attachment_id=%llu",
+                        static_cast<unsigned long long>(attachment_id));
+                    return false;
                 }
 
                 int event_fd = event_fd_it->second;
 
                 auto publisher_attachment_it = publisher_attachment_by_event_fd.find(event_fd);
                 if (publisher_attachment_it == publisher_attachment_by_event_fd.end()) {
-                    exit(1);
+                    LOG_FATAL("PublisherDisconnectedEventFdMissingError: attachment_id=%llu event_fd=%d",
+                        static_cast<unsigned long long>(attachment_id),
+                        event_fd);
+                    return false;
                 }
 
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_fd, nullptr);
@@ -324,13 +348,12 @@ void process_broker_control_messages() {
                 break;
             }
             default: {
-                cerr << "UnexpectedBrokerMessageTypeError: type="
-                     << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
-                     << ", bytes=" << received_size << ", broker_fd=" << broker_fd << endl;
-                exit(1);
+                LOG_FATAL("UnexpectedBrokerMessageTypeError: type=%u, bytes=%zd, broker_fd=%d", static_cast<unsigned int>(static_cast<unsigned char>(packet[0])), received_size, broker_fd);
+                return false;
             }
         }
     }
+    return true;
 }
 
 int main(int argc, char *argv[]) {
@@ -340,6 +363,15 @@ int main(int argc, char *argv[]) {
              << ", max_topics=" << kMaxSubscriberTopicCount << endl;
         return 1;
     }
+
+    const char *run_id = std::getenv("DRIVEBUS_RUN_ID");
+    if (run_id == nullptr || *run_id == '\0') {
+        std::cerr << "DriveBusRunIdMissingError\n ";
+        return 1;
+    }
+
+    Logger::init(subscriber_log_path(run_id));
+
     uint32_t topic_count = static_cast<uint32_t>(argc - 1);
 
     const string path = "/tmp/broker.sock";
@@ -358,9 +390,11 @@ int main(int argc, char *argv[]) {
         ret = connect(broker_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     }
     if (ret < 0) {
-        cerr << "SubscriberBrokerConnectError: attempts=" << fail_num
-             << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
-        return -1;
+        LOG_FATAL("SubscriberBrokerConnectError: attempts=%d, errno=%d (%s)",
+            fail_num,
+            errno,
+            strerror(errno));
+        return 1;
     }
 
     char packet[kSubscriberTopicRegistrationMessageSize]{};
@@ -381,17 +415,21 @@ int main(int argc, char *argv[]) {
     int maxevents = 1024;
     epoll_event events[maxevents];
 
-    while (true) {
+    int subscriber_exit_code = 0;
+    bool subscriber_running = true;
+    while (subscriber_running) {
         int event_count = epoll_wait(epoll_fd, events, maxevents, -1);
-        cout << "event_cout = " << event_count << endl;
+        LOG_DEBUG("epoll event_count=%d", event_count);
 
         for (int i = 0; i < event_count; ++i) {
             int fd = events[i].data.fd;
             if (fd != broker_fd) {
                 auto publisher_attachment_it = publisher_attachment_by_event_fd.find(fd);
                 if (publisher_attachment_it == publisher_attachment_by_event_fd.end()) {
-                    cerr << "SubscriberEventFdAttachmentMissingError: event_fd=" << fd << endl;
-                    return 1;
+                    LOG_FATAL("SubscriberEventFdAttachmentMissingError: event_fd=%d", fd);
+                    subscriber_exit_code = 1;
+                    subscriber_running = false;
+                    break;
                 }
                 PublisherAttachment &publisher_attachment = publisher_attachment_it->second;
 
@@ -401,22 +439,38 @@ int main(int argc, char *argv[]) {
                 initialize_subscriber_read_index(publisher_attachment);
 
                 uint32_t wr = publisher_attachment.shared_data->descriptor_write_index.load(std::memory_order_acquire);
-                cout << "wr is " << wr << ", rd is " << publisher_attachment.subscriber_read_index << endl;
+                LOG_DEBUG("descriptor indices: wr=%u rd=%u", wr, publisher_attachment.subscriber_read_index);
+
                 if (publisher_attachment.subscriber_read_index > wr) {
-                    const size_t descriptor_count = static_cast<size_t>(kDescriptorSlotCount - publisher_attachment.subscriber_read_index);
+                    const size_t descriptor_count = static_cast<size_t>(
+                        kDescriptorSlotCount - publisher_attachment.subscriber_read_index);
+
                     MessageDescriptor desc_ring[descriptor_count];
                     copy(publisher_attachment.shared_data->desc_ring + publisher_attachment.subscriber_read_index,
                         publisher_attachment.shared_data->desc_ring + kDescriptorSlotCount,
                         desc_ring);
 
-                    read_data(publisher_attachment, desc_ring, descriptor_count);
+                    if (!read_data(publisher_attachment, desc_ring, descriptor_count)) {
+                        subscriber_exit_code = 1;
+                        subscriber_running = false;
+                        break;
+                    }
                     wr = publisher_attachment.shared_data->descriptor_write_index.load(std::memory_order_acquire);
                 }
 
-                consume_contiguous_messages(publisher_attachment);
-                cout << "read over" << endl;
+                if (!consume_contiguous_messages(publisher_attachment)) {
+                    subscriber_exit_code = 1;
+                    subscriber_running = false;
+                    break;
+                }
+
+                LOG_DEBUG("subscriber event processed: event_fd=%d", fd);
             } else if (fd == broker_fd) {
-                process_broker_control_messages();
+                if (!process_broker_control_messages()) {
+                    subscriber_exit_code = 1;
+                    subscriber_running = false;
+                    break;
+                }
             }
         }
         this_thread::sleep_for(chrono::milliseconds(1));
@@ -430,9 +484,10 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < kClassCount; ++i) {
             for (int j = 0; j < kMaxChunkCountPerSizeClass; ++j) {
                 if (p->chunk_usage_tracker.is_in_use[i][j] == true) {
-                    cerr << "SubscriberChunkStillInUseError: event_fd=" << event_fd
-                         << ", class=" << i
-                         << ", index=" << j << endl;
+                    LOG_WARN("subscriber stopping with unreleased chunk: event_fd=%d class=%d index=%d",
+                        event_fd,
+                        i,
+                        j);
                 }
             }
         }
@@ -448,5 +503,5 @@ int main(int argc, char *argv[]) {
         close(event_fd);
     }
 
-    return 0;
+    return subscriber_exit_code;
 }

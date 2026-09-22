@@ -1,3 +1,4 @@
+#include "include/logger.h"
 #include "include/broker_protocol.hpp"
 #include "include/shared_memory_layout.hpp"
 #include "include/shared_memory_layout_helpers.hpp"
@@ -6,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -22,6 +24,17 @@
 #include <stdint.h>
 #include <vector>
 using namespace std;
+
+std::filesystem::path publisher_log_path() {
+    const char *run_id_env = std::getenv("DRIVEBUS_RUN_ID");
+    const string run_id = run_id_env != nullptr && *run_id_env != '\0' ? run_id_env : "standalone";
+    const auto start_us = chrono::duration_cast<chrono::microseconds>(chrono::system_clock::now().time_since_epoch()).count();
+
+    return std::filesystem::path("logs") /
+        run_id /
+        "publisher" /
+        ("pid-" + to_string(getpid()) + "-start-" + to_string(start_us) + ".log");
+}
 
 uint32_t get_msg_size() {
     random_device rd;
@@ -43,7 +56,7 @@ uint32_t get_msg_size() {
 }
 
 struct SubscriberRegistration {
-    int event_fd;
+    int data_available_event_fd;
     uint32_t slot_index;
 };
 
@@ -57,10 +70,11 @@ optional<SubscriberRegistration> receive_subscriber_registration(int broker_fd) 
 
     BrokerMessageType message_type = static_cast<BrokerMessageType>(packet[0]);
     if (message_type != BrokerMessageType::SubscriberEventFdAndSlot) {
-        cerr << "InitialSubscriberRegistrationTypeError: expected="
-             << static_cast<unsigned>(BrokerMessageType::SubscriberEventFdAndSlot)
-             << ", actual=" << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
-             << ", bytes=" << ret << ", broker_fd=" << broker_fd << endl;
+        LOG_FATAL("InitialSubscriberRegistrationTypeError: expected=%u actual=%u bytes=%zd broker_fd=%d",
+            static_cast<unsigned>(BrokerMessageType::SubscriberEventFdAndSlot),
+            static_cast<unsigned>(static_cast<unsigned char>(packet[0])),
+            ret,
+            broker_fd);
         exit(1);
     }
     uint32_t received_subscriber_slot_index;
@@ -113,7 +127,7 @@ void init_shm(SharedData &shm) {
     }
 }
 
-vector<int> event_fds{};
+vector<int> data_available_event_fds{};
 
 constexpr size_t kMaxEvents = 1024;
 
@@ -157,8 +171,10 @@ void release_chunk_references_in_descriptor_range(size_t start, size_t end, uint
                 size_t chunk_index = (offset - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
                 // cout << "the " << chunk_index << " chunk free" << endl;
                 if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == false) {
-                    cerr << "PublisherChunkDoubleFreeError: class=" << size_class
-                         << ", index=" << chunk_index << ", offset=" << offset << endl;
+                    LOG_FATAL("PublisherChunkDoubleFreeError: class=%d index=%zu offset=%u",
+                        size_class,
+                        chunk_index,
+                        offset);
                     pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
                     exit(1);
                 }
@@ -176,8 +192,8 @@ void release_chunk_references_in_descriptor_range(size_t start, size_t end, uint
     }
 }
 
-std::unordered_map<int, size_t> subscriber_slot_index_by_event_fd{};
-std::array<int, kMaxSubscribers> event_fd_by_subscriber_slot_index{};
+std::unordered_map<int, size_t> subscriber_slot_index_by_data_available_event_fd{};
+std::array<int, kMaxSubscribers> data_available_event_fd_by_subscriber_slot_index{};
 
 void reap_dead_subscribers(uint32_t slot_index) {
     uint32_t subscriber_reference_bit = 1 << slot_index;
@@ -191,22 +207,24 @@ void reap_dead_subscribers(uint32_t slot_index) {
     release_chunk_references_in_descriptor_range(rd, wr, subscriber_reference_bit);
     p->descriptor_read_indices[slot_index].store(kInvalidIndex, memory_order_relaxed);
 
-    const int event_fd = event_fd_by_subscriber_slot_index[slot_index];
-    subscriber_slot_index_by_event_fd.erase(event_fd);
-    erase(event_fds, event_fd);
-    close(event_fd);
+    const int data_available_event_fd = data_available_event_fd_by_subscriber_slot_index[slot_index];
+    subscriber_slot_index_by_data_available_event_fd.erase(data_available_event_fd);
+    erase(data_available_event_fds, data_available_event_fd);
+    close(data_available_event_fd);
 }
 
 void track_subscriber(SubscriberRegistration registration) {
     if (registration.slot_index >= kMaxSubscribers) {
-        cerr << "PublisherSubscriberSlotRangeError: slot=" << registration.slot_index
-             << ", max=" << kMaxSubscribers << ", event_fd=" << registration.event_fd << endl;
+        LOG_FATAL("PublisherSubscriberSlotRangeError: slot=%u max=%zu data_available_event_fd=%d",
+            registration.slot_index,
+            kMaxSubscribers,
+            registration.data_available_event_fd);
         exit(1);
     }
 
-    subscriber_slot_index_by_event_fd.insert({registration.event_fd, registration.slot_index});
-    event_fd_by_subscriber_slot_index[registration.slot_index] = registration.event_fd;
-    event_fds.emplace_back(registration.event_fd);
+    subscriber_slot_index_by_data_available_event_fd.insert({registration.data_available_event_fd, registration.slot_index});
+    data_available_event_fd_by_subscriber_slot_index[registration.slot_index] = registration.data_available_event_fd;
+    data_available_event_fds.emplace_back(registration.data_available_event_fd);
 
     p->descriptor_read_indices[registration.slot_index].store(p->descriptor_write_index.load(memory_order_relaxed), memory_order_relaxed);
 }
@@ -233,18 +251,20 @@ void process_broker_control_messages() {
         const ssize_t received_size = recvmsg(broker_fd, &msg, 0);
 
         if (received_size == 0) {
-            cerr << "PublisherBrokerClosed: broker_fd=" << broker_fd << endl;
+            LOG_ERROR("PublisherBrokerClosed: broker_fd=%d", broker_fd);
             break;
         } else if (received_size < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
-                cerr << "PublisherControlRecvError: broker_fd=" << broker_fd
-                     << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                LOG_ERROR("PublisherControlRecvError: broker_fd=%d errno=%d (%s)",
+                    broker_fd,
+                    errno,
+                    strerror(errno));
                 exit(1);
             }
         } else if (msg.msg_flags & MSG_CTRUNC) {
-            cerr << "MsgTruncatedError\n";
+            LOG_FATAL("MsgTruncatedError");
             exit(1);
         }
 
@@ -255,9 +275,11 @@ void process_broker_control_messages() {
         switch (message_type) {
             case BrokerMessageType::SubscriberDisconnected: {
                 if (body_len != sizeof(uint32_t)) {
-                    cerr << "SubscriberDisconnectPayloadSizeError: expected=" << sizeof(uint32_t)
-                         << ", actual=" << body_len << ", packet=" << received_size
-                         << ", broker_fd=" << broker_fd << endl;
+                    LOG_FATAL("SubscriberDisconnectPayloadSizeError: expected=%zu actual=%zu packet=%zd broker_fd=%d",
+                        sizeof(uint32_t),
+                        body_len,
+                        received_size,
+                        broker_fd);
                     exit(1);
                 }
 
@@ -268,9 +290,11 @@ void process_broker_control_messages() {
             }
             case BrokerMessageType::SubscriberEventFdAndSlot: {
                 if (body_len != sizeof(uint32_t)) {
-                    cerr << "SubscriberRegisteredPayloadSizeError: expected=" << sizeof(uint32_t)
-                         << ", actual=" << body_len << ", packet=" << received_size
-                         << ", broker_fd=" << broker_fd << endl;
+                    LOG_FATAL("SubscriberRegisteredPayloadSizeError: expected=%zu actual=%zu packet=%zd broker_fd=%d",
+                        sizeof(uint32_t),
+                        body_len,
+                        received_size,
+                        broker_fd);
                     exit(1);
                 }
 
@@ -280,24 +304,26 @@ void process_broker_control_messages() {
                 struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
 
                 if (cmsg == nullptr) {
-                    cerr << "SubscriberRegisteredEventFdMissingError: broker_fd=" << broker_fd << endl;
+                    LOG_FATAL("SubscriberRegisteredEventFdMissingError: broker_fd=%d", broker_fd);
                     exit(1);
                 }
                 if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-                    cerr << "SubscriberRegisteredCmsgError: level=" << cmsg->cmsg_level
-                         << ", type=" << cmsg->cmsg_type
-                         << ", broker_fd=" << broker_fd << endl;
+                    LOG_FATAL("SubscriberRegisteredCmsgError: level=%d type=%d broker_fd=%d",
+                        cmsg->cmsg_level,
+                        cmsg->cmsg_type,
+                        broker_fd);
                     exit(1);
                 }
 
-                const int event_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
-                track_subscriber({event_fd, subscriber_slot_index});
+                const int data_available_event_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+                track_subscriber({data_available_event_fd, subscriber_slot_index});
                 break;
             }
             default: {
-                cerr << "UnexpectedBrokerMessageTypeError: type="
-                     << static_cast<unsigned>(static_cast<unsigned char>(packet[0]))
-                     << ", bytes=" << received_size << ", broker_fd=" << broker_fd << endl;
+                LOG_FATAL("UnexpectedBrokerMessageTypeError: type=%u bytes=%zd broker_fd=%d",
+                    static_cast<unsigned>(static_cast<unsigned char>(packet[0])),
+                    received_size,
+                    broker_fd);
                 exit(1);
             }
         }
@@ -310,6 +336,8 @@ int main(int argc, char *argv[]) {
              << " <topic_id> <shm_name>" << endl;
         return 1;
     }
+
+    Logger::init(publisher_log_path());
 
     TopicId topic_id = static_cast<TopicId>(stoul(argv[1]));
     const char *shm_name = argv[2];
@@ -340,8 +368,10 @@ int main(int argc, char *argv[]) {
         ret = connect(broker_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     }
     if (ret < 0) {
-        cerr << "PublisherBrokerConnectError: attempts=" << fail_num
-             << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+        LOG_FATAL("PublisherBrokerConnectError: attempts=%d errno=%d (%s)",
+            fail_num,
+            errno,
+            strerror(errno));
         return -1;
     }
 
@@ -356,18 +386,19 @@ int main(int argc, char *argv[]) {
     {
         ssize_t n = recv(broker_fd, &subscriber_count, sizeof(subscriber_count), 0);
         if (n < 0) {
-            cerr << "InitialSubscriberCountReceiveError: broker_fd=" << broker_fd
-                 << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+            LOG_ERROR("InitialSubscriberCountReceiveError: broker_fd=%d errno=%d (%s)",
+                broker_fd,
+                errno,
+                strerror(errno));
             return 1;
         }
-        cout << "subscriber_count is " << subscriber_count << endl;
+        LOG_INFO("publisher registered: initial_subscriber_count=%u", subscriber_count);
     }
 
     for (size_t i = 0; i < subscriber_count; ++i) {
         auto registration = receive_subscriber_registration(broker_fd);
         if (!registration) {
-            cerr << "ExistingSubscriberRegistrationReceiveError: index=" << i
-                 << ", broker_fd=" << broker_fd << endl;
+            LOG_ERROR("ExistingSubscriberRegistrationReceiveError: index=%zu broker_fd=%d", i, broker_fd);
             return 1;
         }
 
@@ -383,8 +414,7 @@ int main(int argc, char *argv[]) {
         uint32_t message_size_bytes = get_msg_size();
         int size_class = find_size_class(message_size_bytes);
         if (size_class < 0) {
-            cerr << "PublisherMessageSizeClassError: seq=" << seq
-                 << ", size=" << message_size_bytes << endl;
+            LOG_FATAL("PublisherMessageSizeClassError: seq=%d size=%u", seq, message_size_bytes);
             return 1;
         }
 
@@ -395,28 +425,33 @@ int main(int argc, char *argv[]) {
             this_thread::sleep_for(chrono::milliseconds(50));
             process_broker_control_messages();
             min_descriptor_read_index = find_slowest_read_index();
-            cout << "min_read_index == wr: min_read_index is " << min_descriptor_read_index << "  idx " << 1 << " read_index is " << p->descriptor_read_indices[0].load(memory_order_relaxed) << "   idx " << 2 << " read_index is " << p->descriptor_read_indices[1].load(memory_order_relaxed) << endl;
+            LOG_DEBUG("publisher backpressure: min_rd=%u wr=%u rd0=%u rd1=%u",
+                min_descriptor_read_index,
+                wr,
+                p->descriptor_read_indices[0].load(memory_order_relaxed),
+                p->descriptor_read_indices[1].load(memory_order_relaxed));
         }
-        cout << "wr is " << wr << endl;
-        cout << "min_descriptor_read_index is " << min_descriptor_read_index << endl;
-        cout << "idx " << 1 << " read_index is " << p->descriptor_read_indices[0].load(memory_order_relaxed) << endl;
-        cout << "idx " << 2 << " read_index is " << p->descriptor_read_indices[1].load(memory_order_relaxed) << endl;
+        LOG_DEBUG("publisher descriptor state: wr=%u min_rd=%u rd0=%u rd1=%u",
+            wr,
+            min_descriptor_read_index,
+            p->descriptor_read_indices[0].load(memory_order_relaxed),
+            p->descriptor_read_indices[1].load(memory_order_relaxed));
 
         uint32_t head_off = p->head.offset[size_class].load(memory_order_relaxed);
         uint32_t tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
+
         while (head_off == tail_off) {
             this_thread::sleep_for(chrono::milliseconds(50));
             process_broker_control_messages();
             tail_off = p->tail.offset[size_class].load(std::memory_order_acquire);
-            cout << "no node free" << endl;
+            LOG_DEBUG("publisher free-list empty: size_class=%d", size_class);
             // 单写端不需要更新 head_off
         }
 
 #ifdef ENABLE_DEBUG_CHECKS
         {
             if (head_off < kFirstOffset[size_class] || head_off > kLastOffset[size_class]) {
-                cerr << "PublisherChunkOffsetError: class=" << size_class
-                     << ", offset=" << head_off << endl;
+                LOG_FATAL("PublisherChunkOffsetError: class=%d offset=%u", size_class, head_off);
                 return -1;
             }
 
@@ -424,8 +459,10 @@ int main(int argc, char *argv[]) {
 
             size_t chunk_index = (head_off - kFirstOffset[size_class]) / kClassSizeBytes[size_class];
             if (p->chunk_usage_tracker.is_in_use[size_class][chunk_index] == true) {
-                cerr << "PublisherChunkAlreadyInUseError: class=" << size_class
-                     << ", index=" << chunk_index << ", offset=" << head_off << endl;
+                LOG_FATAL("PublisherChunkAlreadyInUseError: class=%d index=%zu offset=%u",
+                    size_class,
+                    chunk_index,
+                    head_off);
                 pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
                 return 1;
             } else {
@@ -457,15 +494,15 @@ int main(int argc, char *argv[]) {
         process_broker_control_messages();
 
         uint32_t chunk_reference_mask = 0;
-        for (size_t event_fd : event_fds) {
-            auto it = subscriber_slot_index_by_event_fd.find(event_fd);
-            if (it == subscriber_slot_index_by_event_fd.end()) {
-                cerr << "PublisherEventFdSlotMapMissingError: event_fd=" << event_fd << endl;
+        for (size_t data_available_event_fd : data_available_event_fds) {
+            auto it = subscriber_slot_index_by_data_available_event_fd.find(data_available_event_fd);
+            if (it == subscriber_slot_index_by_data_available_event_fd.end()) {
+                LOG_FATAL("PublisherEventFdSlotMapMissingError: data_available_event_fd=%d", data_available_event_fd);
                 exit(1);
             }
-            chunk_reference_mask += 1 << subscriber_slot_index_by_event_fd[event_fd];
+            chunk_reference_mask += 1 << subscriber_slot_index_by_data_available_event_fd[data_available_event_fd];
         }
-        cout << "chunk_reference_mask is " << static_cast<int>(chunk_reference_mask) << endl;
+        LOG_DEBUG("publisher chunk_reference_mask=%u", chunk_reference_mask);
         p->chunk_reference_counts[chunk_index].fetch_add(chunk_reference_mask, memory_order_relaxed);
 
         uint32_t candidate = wr + 1;
@@ -473,18 +510,21 @@ int main(int argc, char *argv[]) {
         else p->descriptor_write_index.store(candidate, std::memory_order_release);
 
         uint64_t val = 1;
-        for (int event_fd : event_fds) {
-            write(event_fd, &val, sizeof(val));
+        for (int data_available_event_fd : data_available_event_fds) {
+            write(data_available_event_fd, &val, sizeof(val));
         }
-        cout << "write " << message_size_bytes << " byte " << c << ", seq is " << seq - 1 << endl;
+        LOG_DEBUG("publisher wrote message: bytes=%u fill=%d seq=%d",
+            message_size_bytes,
+            static_cast<int>(c),
+            seq - 1);
         --task_num;
         if (c == 'z') c = 'a' - 1;
     }
     uint64_t val = 1;
-    for (int event_fd : event_fds) {
-        write(event_fd, &val, sizeof(val));
+    for (int data_available_event_fd : data_available_event_fds) {
+        write(data_available_event_fd, &val, sizeof(val));
     }
-    cout << "all write over" << endl;
+    LOG_INFO("publisher completed message production");
 
     munmap(p, sizeof(SharedData));
     close(shm_fd);

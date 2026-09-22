@@ -1,3 +1,4 @@
+#include "include/logger.h"
 #include "include/broker_protocol.hpp"
 #include "include/shared_memory_layout.hpp"
 #include "include/shared_memory_layout_helpers.hpp"
@@ -6,8 +7,10 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstring>
+#include <cstdlib>
 #include <cstddef>
 #include <iomanip>
 #include <iostream>
@@ -29,6 +32,17 @@
 #include <unordered_set>
 #include <vector>
 using namespace std;
+
+std::filesystem::path broker_log_path() {
+    const char *run_id_env = std::getenv("DRIVEBUS_RUN_ID");
+    const string run_id = run_id_env != nullptr && *run_id_env != '\0' ? run_id_env : "standalone";
+    const auto start_us = chrono::duration_cast<chrono::microseconds>(chrono::system_clock::now().time_since_epoch()).count();
+
+    return std::filesystem::path("logs") /
+        run_id /
+        "broker" /
+        ("pid-" + to_string(getpid()) + "-start-" + to_string(start_us) + ".log");
+}
 
 const char *get_topic_name_from_id(TopicId topic_id) {
     switch (topic_id) {
@@ -80,7 +94,9 @@ ssize_t send_subscriber_attachment_batch_message(int subscriber_fd, const vector
     }
 
     if (subscriber_attachments.size() > kMaxAttachmentsPerBatch) {
-        cout << "publish too much" << endl;
+        LOG_ERROR("SubscriberAttachmentBatchCapacityError: attachment_count=%zu max=%zu",
+            subscriber_attachments.size(),
+            kMaxAttachmentsPerBatch);
     }
 
     vector<char> packet(kSubscriberAttachmentBatchMessageMinSize + subscriber_attachments.size() * kSubscriberAttachmentMetadataSize);
@@ -297,15 +313,13 @@ string build_status_snapshot_payload() {
 void handle_subsciber_disconect(int subscriber_fd) {
     auto subscriber_attachments_it = subscriber_attachments_by_subscriber_fd.find(subscriber_fd);
     if (subscriber_attachments_it == subscriber_attachments_by_subscriber_fd.end()) {
-        cerr << "SubscriberDisconnectAttachmentsMissingError: subscriber_fd="
-             << subscriber_fd << endl;
+        LOG_FATAL("SubscriberDisconnectAttachmentsMissingError: subscriber_fd=%d", subscriber_fd);
         exit(1);
     }
 
     auto subscriber_topics_it = topic_ids_by_subscriber_fd.find(subscriber_fd);
     if (subscriber_topics_it == topic_ids_by_subscriber_fd.end()) {
-        cerr << "SubscriberDisconnectTopicsMapMissingError: subscriber_fd="
-             << subscriber_fd << endl;
+        LOG_FATAL("SubscriberDisconnectTopicsMapMissingError: subscriber_fd=%d", subscriber_fd);
         exit(1);
     }
 
@@ -318,25 +332,27 @@ void handle_subsciber_disconect(int subscriber_fd) {
 
         ssize_t n = send(subscriber_attachment.publisher_fd, packet, kSubscriberDisconnectedMessageSize, 0);
         if (n < 0) {
-            cerr << "SubscriberDisconnectSendError: publisher_fd=" << subscriber_attachment.publisher_fd
-                 << ", slot=" << subscriber_attachment.slot_index << ", errno=" << errno
-                 << " (" << strerror(errno) << ')' << endl;
+            LOG_ERROR("SubscriberDisconnectSendError: publisher_fd=%d slot=%u errno=%d (%s)",
+                subscriber_attachment.publisher_fd,
+                subscriber_attachment.slot_index,
+                errno,
+                strerror(errno));
             exit(1);
         }
 
         auto available_subscriber_slots_by_topic_id_it =
             available_subscriber_slots_by_topic_id_and_publisher_fd.find(subscriber_attachment.topic_id);
         if (available_subscriber_slots_by_topic_id_it == available_subscriber_slots_by_topic_id_and_publisher_fd.end()) {
-            cerr << "SubscriberDisconnectAvailableTopicMapMissingError: topic="
-                 << static_cast<unsigned>(subscriber_attachment.topic_id) << endl;
+            LOG_FATAL("SubscriberDisconnectAvailableTopicMapMissingError: topic=%u",
+                static_cast<unsigned>(subscriber_attachment.topic_id));
             exit(1);
         }
         auto available_subscriber_slots_by_publisher_fd_it =
             available_subscriber_slots_by_topic_id_it->second.find(subscriber_attachment.publisher_fd);
         if (available_subscriber_slots_by_publisher_fd_it == available_subscriber_slots_by_topic_id_it->second.end()) {
-            cerr << "SubscriberDisconnectAvailablePublisherMapMissingError: topic="
-                 << static_cast<unsigned>(subscriber_attachment.topic_id)
-                 << ", publisher_fd=" << subscriber_attachment.publisher_fd << endl;
+            LOG_FATAL("SubscriberDisconnectAvailablePublisherMapMissingError: topic=%u publisher_fd=%d",
+                static_cast<unsigned>(subscriber_attachment.topic_id),
+                subscriber_attachment.publisher_fd);
             exit(1);
         }
         available_subscriber_slots_by_publisher_fd_it->second.emplace(subscriber_attachment.slot_index);
@@ -350,16 +366,17 @@ void handle_subsciber_disconect(int subscriber_fd) {
     for (TopicId topic_id : subscriber_topics_it->second) {
         auto topic_subscribers_it = subscriber_fds_by_topic_id.find(topic_id);
         if (topic_subscribers_it == subscriber_fds_by_topic_id.end()) {
-            cerr << "SubscriberDisconnectTopicSubscribersMissingError: topic="
-                 << static_cast<unsigned>(topic_id) << endl;
+            LOG_FATAL("SubscriberDisconnectTopicSubscribersMissingError: topic=%u",
+                static_cast<unsigned>(topic_id));
             exit(1);
         }
         auto subscriber_fd_it = find(topic_subscribers_it->second.begin(),
             topic_subscribers_it->second.end(),
             subscriber_fd);
         if (subscriber_fd_it == topic_subscribers_it->second.end()) {
-            cerr << "SubscriberDisconnectTopicSubscriberMissingError: topic="
-                 << static_cast<unsigned>(topic_id) << ", subscriber_fd=" << subscriber_fd << endl;
+            LOG_FATAL("SubscriberDisconnectTopicSubscriberMissingError: topic=%u subscriber_fd=%d",
+                static_cast<unsigned>(topic_id),
+                subscriber_fd);
             exit(1);
         }
         topic_subscribers_it->second.erase(subscriber_fd_it);
@@ -372,8 +389,7 @@ void handle_subsciber_disconect(int subscriber_fd) {
 void handle_publisher_disconnect(int pubilsher_fd) {
     auto shm_it = shm_fd_by_publisher_fd.find(pubilsher_fd);
     if (shm_it == shm_fd_by_publisher_fd.end()) {
-        cerr << "PublisherDisconnectShmFdMapMissingError: publisher_fd="
-             << pubilsher_fd << endl;
+        LOG_FATAL("PublisherDisconnectShmFdMapMissingError: publisher_fd=%d", pubilsher_fd);
         exit(1);
     }
 
@@ -390,22 +406,22 @@ void handle_publisher_disconnect(int pubilsher_fd) {
         }
     }
     if (topic_publishers_it == publisher_fds_by_topic_id.end()) {
-        cerr << "PublisherDisconnectTopicMapMissingError: publisher_fd="
-             << pubilsher_fd << endl;
+        LOG_FATAL("PublisherDisconnectTopicMapMissingError: publisher_fd=%d", pubilsher_fd);
         exit(1);
     }
     TopicId topic_id = topic_publishers_it->first;
 
     auto available_subscriber_slots_by_topic_id_it = available_subscriber_slots_by_topic_id_and_publisher_fd.find(topic_id);
     if (available_subscriber_slots_by_topic_id_it == available_subscriber_slots_by_topic_id_and_publisher_fd.end()) {
-        cerr << "PublisherDisconnectAvailableTopicMapMissingError: topic="
-             << static_cast<unsigned>(topic_id) << endl;
+        LOG_FATAL("PublisherDisconnectAvailableTopicMapMissingError: topic=%u",
+            static_cast<unsigned>(topic_id));
         exit(1);
     }
     auto available_subscriber_slots_by_publisher_fd_it = available_subscriber_slots_by_topic_id_it->second.find(pubilsher_fd);
     if (available_subscriber_slots_by_publisher_fd_it == available_subscriber_slots_by_topic_id_it->second.end()) {
-        cerr << "PublisherDisconnectAvailableSlotMapMissingError: topic="
-             << static_cast<unsigned>(topic_id) << ", publisher_fd=" << pubilsher_fd << endl;
+        LOG_FATAL("PublisherDisconnectAvailableSlotMapMissingError: topic=%u publisher_fd=%d",
+            static_cast<unsigned>(topic_id),
+            pubilsher_fd);
         exit(1);
     }
 
@@ -414,8 +430,9 @@ void handle_publisher_disconnect(int pubilsher_fd) {
         for (int subscriber_fd : topic_subscribers_it->second) {
             auto subscriber_attachments_it = subscriber_attachments_by_subscriber_fd.find(subscriber_fd);
             if (subscriber_attachments_it == subscriber_attachments_by_subscriber_fd.end()) {
-                cerr << "PublisherDisconnectSubscriberAttachmentsMissingError: topic="
-                     << static_cast<unsigned>(topic_id) << ", subscriber_fd=" << subscriber_fd << endl;
+                LOG_FATAL("PublisherDisconnectSubscriberAttachmentsMissingError: topic=%u subscriber_fd=%d",
+                    static_cast<unsigned>(topic_id),
+                    subscriber_fd);
                 exit(1);
             }
 
@@ -425,9 +442,10 @@ void handle_publisher_disconnect(int pubilsher_fd) {
                     return subscriber_attachment.publisher_fd == pubilsher_fd;
                 });
             if (subscriber_attachment_it == subscriber_attachments_it->second.end()) {
-                cerr << "PublisherDisconnectSubscriberAttachmentMissingError: topic="
-                     << static_cast<unsigned>(topic_id) << ", subscriber_fd=" << subscriber_fd
-                     << ", publisher_fd=" << pubilsher_fd << endl;
+                LOG_FATAL("PublisherDisconnectSubscriberAttachmentMissingError: topic=%u subscriber_fd=%d publisher_fd=%d",
+                    static_cast<unsigned>(topic_id),
+                    subscriber_fd,
+                    pubilsher_fd);
                 exit(1);
             }
 
@@ -468,13 +486,14 @@ void handle_publisher_disconnect(int pubilsher_fd) {
 }
 
 int main() {
+    Logger::init(broker_log_path());
+
     const char *unix_path = "/tmp/broker.sock";
     unlink(unix_path);
 
     int listen_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     if (listen_fd < 0) {
-        cerr << "BrokerListenSocketCreateError: errno=" << errno
-             << " (" << strerror(errno) << ')' << endl;
+        LOG_FATAL("BrokerListenSocketCreateError: errno=%d (%s)", errno, strerror(errno));
         return 1;
     }
     struct sockaddr_un addr{};
@@ -483,24 +502,21 @@ int main() {
 
     int bind_ret = bind(listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     if (bind_ret < 0) {
-        cerr << "BrokerBindError: path=" << unix_path << ", errno=" << errno
-             << " (" << strerror(errno) << ')' << endl;
+        LOG_FATAL("BrokerBindError: path=%s errno=%d (%s)", unix_path, errno, strerror(errno));
         return 1;
     }
 
     int listen_ret = listen(listen_fd, 1024);
     if (listen_ret < 0) {
-        cerr << "BrokerListenError: fd=" << listen_fd << ", errno=" << errno
-             << " (" << strerror(errno) << ')' << endl;
+        LOG_FATAL("BrokerListenError: fd=%d errno=%d (%s)", listen_fd, errno, strerror(errno));
         return 1;
     }
 
-    std::cout << "receiver listening...\n";
+    LOG_INFO("broker listening: path=%s fd=%d", unix_path, listen_fd);
 
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
-        cerr << "BrokerEpollCreateError: errno=" << errno
-             << " (" << strerror(errno) << ')' << endl;
+        LOG_FATAL("BrokerEpollCreateError: errno=%d (%s)", errno, strerror(errno));
         return 1;
     }
 
@@ -527,11 +543,10 @@ int main() {
         int event_count = epoll_wait(epoll_fd, events, maxevents, -1);
 
         if (event_count < 0) {
-            cerr << "BrokerEpollWaitError: errno=" << errno
-                 << " (" << strerror(errno) << ')' << endl;
+            LOG_ERROR("BrokerEpollWaitError: errno=%d (%s)", errno, strerror(errno));
             return 1;
         } else if (event_count == 0) {
-            cerr << "BrokerUnexpectedEpollTimeoutError" << endl;
+            LOG_ERROR("BrokerUnexpectedEpollTimeoutError");
             return 1;
         }
 
@@ -552,14 +567,16 @@ int main() {
                             break;
                         }
 
-                        cerr << "BrokerAcceptError: listen_fd=" << listen_fd
-                             << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                        LOG_ERROR("BrokerAcceptError: listen_fd=%d errno=%d (%s)",
+                            listen_fd,
+                            errno,
+                            strerror(errno));
                         exit(1);
                     }
 
                     client_fds.insert(conn_fd);
                     add_fd_to_epoll(epoll_fd, conn_fd);
-                    cout << "accept fd is " << conn_fd << endl;
+                    LOG_INFO("broker accepted client: fd=%d", conn_fd);
                 }
             } else if (events[event_index].events & EPOLLIN) {
                 char packet[kMaxMessageSize];
@@ -580,10 +597,10 @@ int main() {
                     const ssize_t received_size = recvmsg(fd, &msg, 0);
 
                     if (received_size == 0) {
-                        cerr << "BrokerPeerClosed: fd=" << fd << endl;
+                        LOG_INFO("broker peer closed: fd=%d", fd);
                         auto it = role_by_fd.find(fd);
                         if (it == role_by_fd.end()) {
-                            cerr << "BrokerClosedFdRoleMissingError: fd=" << fd << endl;
+                            LOG_FATAL("BrokerClosedFdRoleMissingError: fd=%d", fd);
                             exit(1);
                         }
 
@@ -596,11 +613,10 @@ int main() {
                             break;
                         }
 
-                        cerr << "BrokerControlRecvError: fd=" << fd
-                             << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                        LOG_ERROR("BrokerControlRecvError: fd=%d errno=%d (%s)", fd, errno, strerror(errno));
                         auto it = role_by_fd.find(fd);
                         if (it == role_by_fd.end()) {
-                            cerr << "BrokerRecvFdRoleMissingError: fd=" << fd << endl;
+                            LOG_FATAL("BrokerRecvFdRoleMissingError: fd=%d", fd);
                             exit(1);
                         }
 
@@ -649,11 +665,15 @@ int main() {
                             const ssize_t sent_size = sendmsg(fd, &msg, 0);
                             if (sent_size != static_cast<ssize_t>(expected_size)) {
                                 if (sent_size < 0) {
-                                    cerr << "BrokerStatusSnapshotSendError: fd=" << fd
-                                         << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                                    LOG_ERROR("BrokerStatusSnapshotSendError: fd=%d errno=%d (%s)",
+                                        fd,
+                                        errno,
+                                        strerror(errno));
                                 } else {
-                                    cerr << "BrokerStatusSnapshotSendSizeError: fd=" << fd
-                                         << ", expected=" << sizeof(expected_size) << ", actual=" << sent_size << endl;
+                                    LOG_ERROR("BrokerStatusSnapshotSendSizeError: fd=%d expected=%zu actual=%zd",
+                                        fd,
+                                        expected_size,
+                                        sent_size);
                                 }
                             }
 
@@ -667,18 +687,20 @@ int main() {
                         }
                         case BrokerMessageType::SubscriberTopicRegistration: {
                             if (received_size != kSubscriberTopicRegistrationMessageSize) {
-                                cerr << "SubscriberTopicRegistrationMessageSizeError: expected="
-                                     << kSubscriberTopicRegistrationMessageSize
-                                     << ", actual=" << received_size << ", fd=" << fd << endl;
+                                LOG_FATAL("SubscriberTopicRegistrationMessageSizeError: expected=%zu actual=%zd fd=%d",
+                                    kSubscriberTopicRegistrationMessageSize,
+                                    received_size,
+                                    fd);
                                 exit(1);
                             }
 
                             uint32_t topic_count;
                             memcpy(&topic_count, packet + sizeof(BrokerMessageType), sizeof(topic_count));
                             if (topic_count == 0 || topic_count > kMaxSubscriberTopicCount) {
-                                cerr << "SubscriberTopicRegistrationCountError: min=1, max="
-                                     << kMaxSubscriberTopicCount << ", actual=" << topic_count
-                                     << ", fd=" << fd << endl;
+                                LOG_FATAL("SubscriberTopicRegistrationCountError: min=1 max=%zu actual=%u fd=%d",
+                                    kMaxSubscriberTopicCount,
+                                    topic_count,
+                                    fd);
                                 exit(1);
                             }
 
@@ -710,8 +732,8 @@ int main() {
 
                                 auto available_subscriber_slots_by_topic_id_it = available_subscriber_slots_by_topic_id_and_publisher_fd.find(topic_id);
                                 if (available_subscriber_slots_by_topic_id_it == available_subscriber_slots_by_topic_id_and_publisher_fd.end()) {
-                                    cerr << "SubscriberTopicAvailableTopicMapMissingError: topic="
-                                         << static_cast<unsigned>(topic_id) << endl;
+                                    LOG_FATAL("SubscriberTopicAvailableTopicMapMissingError: topic=%u",
+                                        static_cast<unsigned>(topic_id));
                                     exit(1);
                                 }
 
@@ -719,23 +741,25 @@ int main() {
                                 for (int publisher_fd : topic_publishers_it->second) {
                                     auto shm_it = shm_fd_by_publisher_fd.find(publisher_fd);
                                     if (shm_it == shm_fd_by_publisher_fd.end()) {
-                                        cerr << "SubscriberTopicShmFdMapMissingError: topic="
-                                             << static_cast<unsigned>(topic_id) << ", publisher_fd=" << publisher_fd << endl;
+                                        LOG_FATAL("SubscriberTopicShmFdMapMissingError: topic=%u publisher_fd=%d",
+                                            static_cast<unsigned>(topic_id),
+                                            publisher_fd);
                                         exit(1);
                                     }
                                     int shm_fd = shm_it->second;
 
                                     auto available_subscriber_slots_by_publisher_fd_it = available_subscriber_slots_by_topic_id_it->second.find(publisher_fd);
                                     if (available_subscriber_slots_by_publisher_fd_it == available_subscriber_slots_by_topic_id_it->second.end()) {
-                                        cerr << "SubscriberTopicAvailablePublisherMapMissingError: topic="
-                                             << static_cast<unsigned>(topic_id) << ", publisher_fd=" << publisher_fd << endl;
+                                        LOG_FATAL("SubscriberTopicAvailablePublisherMapMissingError: topic=%u publisher_fd=%d",
+                                            static_cast<unsigned>(topic_id),
+                                            publisher_fd);
                                         exit(1);
                                     }
                                     auto &available_subscriber_slots = available_subscriber_slots_by_publisher_fd_it->second;
                                     if (available_subscriber_slots.empty()) {
-                                        cerr << "BrokerNoFreeSubscriberSlotError: topic="
-                                             << static_cast<unsigned>(topic_id)
-                                             << ", publisher_fd=" << publisher_fd << endl;
+                                        LOG_FATAL("BrokerNoFreeSubscriberSlotError: topic=%u publisher_fd=%d",
+                                            static_cast<unsigned>(topic_id),
+                                            publisher_fd);
                                         exit(1);
                                     }
                                     int event_fd = eventfd(0, EFD_NONBLOCK);
@@ -760,7 +784,9 @@ int main() {
                             }
 
                             if (!subscriber_attachments.empty())
-                                cout << "send fd and subscriber_slot_index" << endl;
+                                LOG_INFO("broker installed subscriber attachments: subscriber_fd=%d count=%zu",
+                                    fd,
+                                    subscriber_attachments.size());
 
                             subscriber_attachments_by_subscriber_fd.insert({fd, std::move(subscriber_attachments)});
                             break;
@@ -769,14 +795,14 @@ int main() {
                             struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
 
                             if (cmsg == nullptr) {
-                                cerr << "PublisherRegistrationShmFdMissingError: fd="
-                                     << fd << endl;
+                                LOG_FATAL("PublisherRegistrationShmFdMissingError: fd=%d", fd);
                                 exit(1);
                             }
                             if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-                                cerr << "PublisherRegistrationCmsgError: level="
-                                     << cmsg->cmsg_level << ", type=" << cmsg->cmsg_type
-                                     << ", fd=" << fd << endl;
+                                LOG_FATAL("PublisherRegistrationCmsgError: level=%d type=%d fd=%d",
+                                    cmsg->cmsg_level,
+                                    cmsg->cmsg_type,
+                                    fd);
                                 exit(1);
                             }
 
@@ -791,8 +817,9 @@ int main() {
                             auto [available_subscriber_slots_by_publisher_fd_it, insert_success] =
                                 available_subscriber_slots_by_publisher_fd.insert({fd, {}});
                             if (!insert_success) {
-                                cerr << "PublisherSlotIndexHeapAlreadyExistsError: topic="
-                                     << static_cast<unsigned>(topic_id) << ", fd=" << fd << endl;
+                                LOG_FATAL("PublisherSlotIndexHeapAlreadyExistsError: topic=%u fd=%d",
+                                    static_cast<unsigned>(topic_id),
+                                    fd);
                                 exit(1);
                             }
                             AvailableSubscriberSlotMinHeap &available_subscriber_slots =
@@ -806,18 +833,20 @@ int main() {
                                 ? 0
                                 : topic_subscribers_it->second.size();
                             if (subscriber_count > available_subscriber_slots.size()) {
-                                cerr << "BrokerSubscriberSlotCapacityError: topic="
-                                     << static_cast<unsigned>(topic_id)
-                                     << ", subscriber_count=" << subscriber_count
-                                     << ", available=" << available_subscriber_slots.size() << endl;
+                                LOG_FATAL("BrokerSubscriberSlotCapacityError: topic=%u subscriber_count=%zu available=%zu",
+                                    static_cast<unsigned>(topic_id),
+                                    subscriber_count,
+                                    available_subscriber_slots.size());
                                 exit(1);
                             }
 
                             uint32_t registered_subscriber_count = static_cast<uint32_t>(subscriber_count);
                             ssize_t n = send(fd, &registered_subscriber_count, sizeof(registered_subscriber_count), 0);
                             if (n < 0) {
-                                cerr << "InitialSubscriberCountSendError: fd=" << fd
-                                     << ", errno=" << errno << " (" << strerror(errno) << ')' << endl;
+                                LOG_ERROR("InitialSubscriberCountSendError: fd=%d errno=%d (%s)",
+                                    fd,
+                                    errno,
+                                    strerror(errno));
                                 return 1;
                             }
 
@@ -841,9 +870,9 @@ int main() {
 
                                     auto subscriber_attachments_it = subscriber_attachments_by_subscriber_fd.find(subscriber_fd);
                                     if (subscriber_attachments_it == subscriber_attachments_by_subscriber_fd.end()) {
-                                        cerr << "PublisherRegistrationSubscriberAttachmentsMissingError: topic="
-                                             << static_cast<unsigned>(topic_id)
-                                             << ", subscriber_fd=" << subscriber_fd << endl;
+                                        LOG_FATAL("PublisherRegistrationSubscriberAttachmentsMissingError: topic=%u subscriber_fd=%d",
+                                            static_cast<unsigned>(topic_id),
+                                            subscriber_fd);
                                         exit(1);
                                     }
                                     subscriber_attachments_it->second.emplace_back(std::move(attachment));

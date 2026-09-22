@@ -25,14 +25,14 @@ all: $(TARGETS)
 rebuild:
 	$(MAKE) -B all
 
-a.out: a.cpp src/fd_helpers.cpp $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) a.cpp src/fd_helpers.cpp -o $@
+a.out: a.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) a.cpp src/fd_helpers.cpp src/logger.cpp -o $@
 
-b.out: b.cpp src/fd_helpers.cpp $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) b.cpp src/fd_helpers.cpp -o $@
+b.out: b.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) b.cpp src/fd_helpers.cpp src/logger.cpp -o $@
 
-broker.out: broker.cpp src/fd_helpers.cpp $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker.cpp src/fd_helpers.cpp -o $@
+broker.out: broker.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker.cpp src/fd_helpers.cpp src/logger.cpp -o $@
 
 broker-status: broker_status_cli.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker_status_cli.cpp -o $@

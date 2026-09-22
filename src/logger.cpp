@@ -1,68 +1,57 @@
-#include "logger.h"
+#include "../include/logger.h"
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 using namespace std;
-
-AsyncLogger::LOGLEVEL AsyncLogger::m_min_level = AsyncLogger::INFO;
 
 static string getTimestamp() {
     auto now = chrono::system_clock::now();
     auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
     time_t t = chrono::system_clock::to_time_t(now);
+    tm local_tm{};
+    if (localtime_r(&t, &local_tm) == nullptr) {
+        return {};
+    }
     string buf;
     buf.resize(32);
-    size_t len = strftime(buf.data(), buf.capacity(), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    size_t len = strftime(buf.data(), buf.size(), "%Y-%m-%d %H:%M:%S", &local_tm);
     buf.resize(len);
     buf += ".";
     buf += to_string(ms.count());
     return buf;
 }
 
-AsyncLogger *g_instance = nullptr;
+Logger::Logger(const std::filesystem::path &log_file_path, size_t flush_threshold) : flush_threshold_(flush_threshold) {
+    const auto parent_path = log_file_path.parent_path();
+    if (!parent_path.empty()) {
+        std::filesystem::create_directories(parent_path);
+    }
 
-AsyncLogger &AsyncLogger::getInstance() {
-    static once_flag flag;
-    call_once(flag, [] {
-        g_instance = new AsyncLogger(5);
-        pthread_atfork(nullptr, nullptr, AsyncLogger::forkChildReset);
-        atexit([] {
-            delete g_instance;
-            g_instance = nullptr;
-        });
-    });
-    return *g_instance;
-}
-
-void AsyncLogger::forkChildReset() {
-    g_instance = new AsyncLogger(5);
-}
-
-AsyncLogger::AsyncLogger(size_t flush_threshold) : m_flush_threshold(flush_threshold) {
-    m_file.open("logs/server.log", ios::app);
-    if (!m_file.is_open()) {
+    file_.open(log_file_path, ios::app);
+    if (!file_.is_open()) {
         std::cerr << "log file open failed!" << std::endl;
     }
 
-    m_backend = thread(&AsyncLogger::backend, this);
+    backend_ = thread(&Logger::backend, this);
 }
 
-AsyncLogger::~AsyncLogger() {
+Logger::~Logger() {
     {
-        lock_guard<mutex> lock(m_mutex);
-        m_stop = true;
+        lock_guard<mutex> lock(mutex_);
+        stop_ = true;
     }
 
-    m_cond.notify_one();
-    if (m_backend.joinable()) {
-        m_backend.join();
+    cond_.notify_all();
+    if (backend_.joinable()) {
+        backend_.join();
     }
 }
 
 constexpr size_t STACK_BUF_SIZE = 1024;
 
-void AsyncLogger::logf(LOGLEVEL level, const char *file, int line, const char *func, const char *fmt, ...) {
+void Logger::logf(LOGLEVEL level, const char *file, int line, const char *func, const char *fmt, ...) {
     if (level < getMinLevel()) return;
 
     char stack_buf[STACK_BUF_SIZE];
@@ -118,43 +107,57 @@ void AsyncLogger::logf(LOGLEVEL level, const char *file, int line, const char *f
     log(level, string_view(heap_buf.get(), total_len));
 }
 
-void AsyncLogger::log(LOGLEVEL level, string_view message) {
-    if (level < m_min_level) return;
+void Logger::log(LOGLEVEL level, string_view message) {
+    if (level < min_level_) return;
 
     string entry;
     entry.reserve(128);
-    entry += getTimestamp();
+
+    const string timestamp = getTimestamp();
+    entry += timestamp.empty() ? "<timestamp-unavailable>" : timestamp;
     entry += " ";
     entry += levelToString(level);
     entry += " ";
     entry += message;
 
     {
-        lock_guard<mutex> lock(m_mutex);
-        m_front_buffer.emplace(std::move(entry));
-        if (m_front_buffer.size() > m_flush_threshold) {
-            m_cond.notify_one();
+        lock_guard<mutex> lock(mutex_);
+        front_buffer_.emplace(std::move(entry));
+        if (front_buffer_.size() >= flush_threshold_) {
+            cond_.notify_one();
         }
     }
 }
 
-void AsyncLogger::setFilePath(const string file_path) {
-    m_file.close();
-    m_file.open(file_path, ios::app);
+void Logger::setLogFilePath(std::filesystem::path &log_file_path) {
+    const auto parent_path = log_file_path.parent_path();
+    if (!parent_path.empty()) {
+        std::filesystem::create_directories(parent_path);
+    }
+
+    {
+        lock_guard<mutex> lock(mutex_);
+        file_.close();
+        file_.open(log_file_path, ios::app);
+
+        if (!file_.is_open()) {
+            std::cerr << "log file open failed!" << std::endl;
+        }
+    }
 }
 
-void AsyncLogger::setLevel(string_view min_level) {
-    if (min_level == "DEBUG") m_min_level = DEBUG;
-    else if (min_level == "INFO") m_min_level = INFO;
-    else if (min_level == "WARN") m_min_level = WARN;
-    else if (min_level == "ERROR") m_min_level = ERROR;
-    else if (min_level == "FATAL") m_min_level = FATAL;
+void Logger::setLevel(string_view min_level) {
+    if (min_level == "DEBUG") min_level_ = DEBUG;
+    else if (min_level == "INFO") min_level_ = INFO;
+    else if (min_level == "WARN") min_level_ = WARN;
+    else if (min_level == "ERROR") min_level_ = ERROR;
+    else if (min_level == "FATAL") min_level_ = FATAL;
     else {
         cerr << "no level" << endl;
     }
 }
 
-string_view AsyncLogger::levelToString(AsyncLogger::LOGLEVEL level) const {
+string_view Logger::levelToString(Logger::LOGLEVEL level) const {
     switch (level) {
         case DEBUG:
             return "DEBUG";
@@ -171,22 +174,20 @@ string_view AsyncLogger::levelToString(AsyncLogger::LOGLEVEL level) const {
     }
 }
 
-void AsyncLogger::backend() {
+void Logger::backend() {
     while (1) {
-        {
-            unique_lock<mutex> lock(m_mutex);
-            m_cond.wait_for(lock, std::chrono::seconds(3), [this] { return m_stop || m_front_buffer.size() >= m_flush_threshold; });
+        unique_lock<mutex> lock(mutex_);
+        cond_.wait_for(lock, std::chrono::seconds(3), [this] { return stop_ || front_buffer_.size() >= flush_threshold_; });
 
-            m_back_buffer.swap(m_front_buffer);
+        back_buffer_.swap(front_buffer_);
+
+        while (!back_buffer_.empty()) {
+            file_ << back_buffer_.front() << '\n';
+            back_buffer_.pop();
         }
+        file_.flush();
 
-        while (!m_back_buffer.empty()) {
-            m_file << m_back_buffer.front() << '\n';
-            m_back_buffer.pop();
-        }
-        m_file.flush();
-
-        if (m_stop) {
+        if (stop_) {
             return;
         }
     }
