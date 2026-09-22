@@ -21,7 +21,11 @@
 #include <unordered_map>
 using namespace std;
 
-std::filesystem::path subscriber_log_path(const std::string &run_id) {
+constexpr size_t kMaxEvents = 1024;
+
+std::filesystem::path subscriber_log_path() {
+    const char *run_id_env = std::getenv("DRIVEBUS_RUN_ID");
+    const string run_id = run_id_env != nullptr && *run_id_env != '\0' ? run_id_env : "standalone";
     const auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
     return std::filesystem::path("logs") /
@@ -35,7 +39,8 @@ struct PublisherAttachment {
     TopicId topic_id = TopicId::Invalid;
     int shm_fd = -1;
     SharedData *shared_data = nullptr;
-    int event_fd = -1;
+    int space_available_event_fd = -1;
+    int data_available_event_fd = -1;
     uint32_t slot_index = kInvalidIndex;
     uint32_t subscriber_read_index = kInvalidIndex;
     int expected_seq = -1;
@@ -155,6 +160,14 @@ bool read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc
             uint32_t last_tail_off = p->tail.offset[size_class].load(memory_order_relaxed);
             memcpy(p->data + last_tail_off, &offset, sizeof(uint32_t));
             p->tail.offset[size_class].store(offset, std::memory_order_release);
+
+            if (eventfd_write(publisher_attachment.space_available_event_fd, 1) < 0) {
+                LOG_ERROR("SubscriberSpaceAvailableSignalError: event_fd=%d errno=%d (%s)",
+                    publisher_attachment.space_available_event_fd,
+                    errno,
+                    strerror(errno));
+                return false;
+            }
         }
     }
     return true;
@@ -187,12 +200,12 @@ bool consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
 int epoll_fd = -1;
 int broker_fd = -1;
 
-unordered_map<int, PublisherAttachment> publisher_attachment_by_event_fd;
-unordered_map<AttachmentId, int> event_fd_by_attachment_id;
+unordered_map<int, PublisherAttachment> publisher_attachment_by_data_available_event_fd;
+unordered_map<AttachmentId, int> data_available_event_fd_by_attachment_id;
 
 bool process_broker_control_messages() {
     char packet[kMaxMessageSize];
-    char control[CMSG_SPACE(kMaxAttachmentsPerBatch * 2 * sizeof(int))];
+    char control[CMSG_SPACE(kMaxAttachmentsPerBatch * 3 * sizeof(int))];
 
     struct iovec iov{};
     iov.iov_base = packet;
@@ -237,7 +250,8 @@ bool process_broker_control_messages() {
                     [slot_index]
 
                 SCM_RIGHTS:
-                    [shm_fd_0, event_fd_0, shm_fd_1, event_fd_1, ...]
+                    [shm_fd_0, space_event_fd_0, data_event_fd_0,
+                     shm_fd_1, space_event_fd_1,  data_event_fd_1, ...]
                 */
 
                 if (body_len % kSubscriberAttachmentMetadataSize != 0) {
@@ -269,7 +283,7 @@ bool process_broker_control_messages() {
                 }
 
                 const size_t fd_count = fd_data_size / sizeof(int);
-                if (fd_count != attachment_count * 2) {
+                if (fd_count != attachment_count * 3) {
                     LOG_FATAL("SubscriberAttachmentBatchFdCountError");
                     return false;
                 }
@@ -291,8 +305,9 @@ bool process_broker_control_messages() {
                     memcpy(&attachment.slot_index, packet + packet_offset, sizeof(attachment.slot_index));
                     packet_offset += sizeof(attachment.slot_index);
 
-                    attachment.shm_fd = fds[2 * attachment_index];
-                    attachment.event_fd = fds[2 * attachment_index + 1];
+                    attachment.shm_fd = fds[3 * attachment_index];
+                    attachment.space_available_event_fd = fds[3 * attachment_index + 1];
+                    attachment.data_available_event_fd = fds[3 * attachment_index + 2];
 
                     attachment.shared_data = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, attachment.shm_fd, 0));
 
@@ -301,10 +316,49 @@ bool process_broker_control_messages() {
                         return false;
                     }
 
-                    event_fd_by_attachment_id.insert({attachment_id, attachment.event_fd});
+                    if (!add_fd_to_epoll(epoll_fd, attachment.data_available_event_fd)) {
+                        LOG_ERROR("SubscriberAttachmentEpollAddError: epoll_fd=%d event_fd=%d errno=%d (%s)",
+                            epoll_fd,
+                            attachment.data_available_event_fd,
+                            errno,
+                            strerror(errno));
+                        munmap(attachment.shared_data, sizeof(SharedData));
+                        close(attachment.shm_fd);
+                        close(attachment.space_available_event_fd);
+                        close(attachment.data_available_event_fd);
+                        return false;
+                    }
 
-                    add_fd_to_epoll(epoll_fd, attachment.event_fd);
-                    publisher_attachment_by_event_fd.insert({attachment.event_fd, std::move(attachment)});
+                    auto [attachment_id_it, attachment_id_inserted] =
+                        data_available_event_fd_by_attachment_id.insert({attachment_id, attachment.data_available_event_fd});
+                    if (!attachment_id_inserted) {
+                        LOG_FATAL("SubscriberAttachmentIdAlreadyExistsError: attachment_id=%llu",
+                            static_cast<unsigned long long>(attachment_id));
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, attachment.data_available_event_fd, nullptr);
+                        munmap(attachment.shared_data, sizeof(SharedData));
+                        close(attachment.shm_fd);
+                        close(attachment.space_available_event_fd);
+                        close(attachment.data_available_event_fd);
+                        return false;
+                    }
+
+                    auto attachment_by_event_fd_it =
+                        publisher_attachment_by_data_available_event_fd.find(attachment.data_available_event_fd);
+                    if (attachment_by_event_fd_it != publisher_attachment_by_data_available_event_fd.end()) {
+                        LOG_FATAL("SubscriberDataAvailableEventFdAlreadyExistsError: event_fd=%d",
+                            attachment.data_available_event_fd);
+                        data_available_event_fd_by_attachment_id.erase(attachment_id_it);
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, attachment.data_available_event_fd, nullptr);
+                        munmap(attachment.shared_data, sizeof(SharedData));
+                        close(attachment.shm_fd);
+                        close(attachment.space_available_event_fd);
+                        close(attachment.data_available_event_fd);
+                        return false;
+                    }
+
+                    publisher_attachment_by_data_available_event_fd.emplace(
+                        attachment.data_available_event_fd,
+                        std::move(attachment));
                 }
 
                 LOG_INFO("subscriber attachment batch installed: count=%zu",
@@ -320,31 +374,32 @@ bool process_broker_control_messages() {
                 AttachmentId attachment_id = kInvalidAttachmentId;
                 memcpy(&attachment_id, packet + sizeof(BrokerMessageType), sizeof(attachment_id));
 
-                auto event_fd_it = event_fd_by_attachment_id.find(attachment_id);
-                if (event_fd_it == event_fd_by_attachment_id.end()) {
+                auto data_available_event_fd_it = data_available_event_fd_by_attachment_id.find(attachment_id);
+                if (data_available_event_fd_it == data_available_event_fd_by_attachment_id.end()) {
                     LOG_FATAL("PublisherDisconnectedAttachmentMissingError: attachment_id=%llu",
                         static_cast<unsigned long long>(attachment_id));
                     return false;
                 }
 
-                int event_fd = event_fd_it->second;
+                int data_available_event_fd = data_available_event_fd_it->second;
 
-                auto publisher_attachment_it = publisher_attachment_by_event_fd.find(event_fd);
-                if (publisher_attachment_it == publisher_attachment_by_event_fd.end()) {
-                    LOG_FATAL("PublisherDisconnectedEventFdMissingError: attachment_id=%llu event_fd=%d",
+                auto publisher_attachment_it = publisher_attachment_by_data_available_event_fd.find(data_available_event_fd);
+                if (publisher_attachment_it == publisher_attachment_by_data_available_event_fd.end()) {
+                    LOG_FATAL("PublisherDisconnectedEventFdMissingError: attachment_id=%llu data_available_event_fd=%d",
                         static_cast<unsigned long long>(attachment_id),
-                        event_fd);
+                        data_available_event_fd);
                     return false;
                 }
 
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_fd, nullptr);
-                close(event_fd);
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, data_available_event_fd, nullptr);
+                close(publisher_attachment_it->second.space_available_event_fd);
+                close(data_available_event_fd);
 
                 munmap(publisher_attachment_it->second.shared_data, sizeof(SharedData));
                 close(publisher_attachment_it->second.shm_fd);
 
-                event_fd_by_attachment_id.erase(event_fd_it);
-                publisher_attachment_by_event_fd.erase(publisher_attachment_it);
+                data_available_event_fd_by_attachment_id.erase(data_available_event_fd_it);
+                publisher_attachment_by_data_available_event_fd.erase(publisher_attachment_it);
                 break;
             }
             default: {
@@ -364,19 +419,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    const char *run_id = std::getenv("DRIVEBUS_RUN_ID");
-    if (run_id == nullptr || *run_id == '\0') {
-        std::cerr << "DriveBusRunIdMissingError\n ";
-        return 1;
-    }
-
-    Logger::init(subscriber_log_path(run_id));
+    Logger::init(subscriber_log_path());
 
     uint32_t topic_count = static_cast<uint32_t>(argc - 1);
 
     const string path = "/tmp/broker.sock";
 
     broker_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (broker_fd < 0) {
+        LOG_ERROR("SubscriberBrokerSocketCreateError: errno=%d (%s)", errno, strerror(errno));
+        return 1;
+    }
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -407,26 +460,52 @@ int main(int argc, char *argv[]) {
             sizeof(topic_id));
     }
 
-    send(broker_fd, packet, sizeof(packet), 0);
+    const ssize_t registration_sent_size = send(broker_fd, packet, sizeof(packet), 0);
+    if (registration_sent_size != static_cast<ssize_t>(sizeof(packet))) {
+        LOG_ERROR("SubscriberRegistrationSendError: expected=%zu actual=%zd errno=%d (%s)",
+            sizeof(packet),
+            registration_sent_size,
+            errno,
+            strerror(errno));
+        return 1;
+    }
 
     epoll_fd = epoll_create1(0);
-    add_fd_to_epoll(epoll_fd, broker_fd);
+    if (epoll_fd < 0) {
+        LOG_ERROR("SubscriberEpollCreateError: errno=%d (%s)", errno, strerror(errno));
+        return 1;
+    }
+    if (!add_fd_to_epoll(epoll_fd, broker_fd)) {
+        LOG_ERROR("SubscriberBrokerEpollAddError: epoll_fd=%d broker_fd=%d errno=%d (%s)",
+            epoll_fd,
+            broker_fd,
+            errno,
+            strerror(errno));
+        return 1;
+    }
 
-    int maxevents = 1024;
-    epoll_event events[maxevents];
+    epoll_event events[kMaxEvents];
 
     int subscriber_exit_code = 0;
     bool subscriber_running = true;
     while (subscriber_running) {
-        int event_count = epoll_wait(epoll_fd, events, maxevents, -1);
+        int event_count = epoll_wait(epoll_fd, events, kMaxEvents, -1);
+        if (event_count < 0) {
+            LOG_ERROR("SubscriberEpollWaitError: errno=%d (%s)", errno, strerror(errno));
+            return 1;
+        }
+        if (event_count == 0) {
+            LOG_ERROR("SubscriberUnexpectedEpollTimeoutError");
+            return 1;
+        }
         LOG_DEBUG("epoll event_count=%d", event_count);
 
         for (int i = 0; i < event_count; ++i) {
             int fd = events[i].data.fd;
             if (fd != broker_fd) {
-                auto publisher_attachment_it = publisher_attachment_by_event_fd.find(fd);
-                if (publisher_attachment_it == publisher_attachment_by_event_fd.end()) {
-                    LOG_FATAL("SubscriberEventFdAttachmentMissingError: event_fd=%d", fd);
+                auto publisher_attachment_it = publisher_attachment_by_data_available_event_fd.find(fd);
+                if (publisher_attachment_it == publisher_attachment_by_data_available_event_fd.end()) {
+                    LOG_FATAL("SubscriberEventFdAttachmentMissingError: data_available_event_fd=%d", fd);
                     subscriber_exit_code = 1;
                     subscriber_running = false;
                     break;
@@ -434,7 +513,18 @@ int main(int argc, char *argv[]) {
                 PublisherAttachment &publisher_attachment = publisher_attachment_it->second;
 
                 uint64_t val;
-                read(fd, &val, sizeof(val));
+                const ssize_t data_event_read_size = read(fd, &val, sizeof(val));
+                if (data_event_read_size != static_cast<ssize_t>(sizeof(val))) {
+                    LOG_ERROR("SubscriberDataAvailableEventReadError: event_fd=%d expected=%zu actual=%zd errno=%d (%s)",
+                        fd,
+                        sizeof(val),
+                        data_event_read_size,
+                        errno,
+                        strerror(errno));
+                    subscriber_exit_code = 1;
+                    subscriber_running = false;
+                    break;
+                }
 
                 initialize_subscriber_read_index(publisher_attachment);
 
@@ -464,7 +554,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                LOG_DEBUG("subscriber event processed: event_fd=%d", fd);
+                LOG_DEBUG("subscriber event processed: data_available_event_fd=%d", fd);
             } else if (fd == broker_fd) {
                 if (!process_broker_control_messages()) {
                     subscriber_exit_code = 1;
@@ -477,15 +567,15 @@ int main(int argc, char *argv[]) {
     }
 
 #ifdef ENABLE_DEBUG_CHECKS
-    for (auto &[event_fd, publisher_attachment] : publisher_attachment_by_event_fd) {
+    for (auto &[data_available_event_fd, publisher_attachment] : publisher_attachment_by_data_available_event_fd) {
         SharedData *p = publisher_attachment.shared_data;
         pthread_mutex_lock(&p->chunk_usage_tracker.mutex);
 
         for (int i = 0; i < kClassCount; ++i) {
             for (int j = 0; j < kMaxChunkCountPerSizeClass; ++j) {
                 if (p->chunk_usage_tracker.is_in_use[i][j] == true) {
-                    LOG_WARN("subscriber stopping with unreleased chunk: event_fd=%d class=%d index=%d",
-                        event_fd,
+                    LOG_WARN("subscriber stopping with unreleased chunk: data_available_event_fd=%d class=%d index=%d",
+                        data_available_event_fd,
                         i,
                         j);
                 }
@@ -497,10 +587,11 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    for (auto &[event_fd, publisher_attachment] : publisher_attachment_by_event_fd) {
+    for (auto &[data_available_event_fd, publisher_attachment] : publisher_attachment_by_data_available_event_fd) {
         munmap(publisher_attachment.shared_data, sizeof(SharedData));
         close(publisher_attachment.shm_fd);
-        close(event_fd);
+        close(publisher_attachment.space_available_event_fd);
+        close(data_available_event_fd);
     }
 
     return subscriber_exit_code;

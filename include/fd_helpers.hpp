@@ -4,8 +4,8 @@
 #include <unistd.h>
 #include <vector>
 
-void set_fd_nonblocking(int fd);
-void add_fd_to_epoll(int epoll_fd, int fd);
+bool set_fd_nonblocking(int fd);
+bool add_fd_to_epoll(int epoll_fd, int fd);
 
 bool is_valid_scm_rights_cmsg(cmsghdr *cmsg);
 

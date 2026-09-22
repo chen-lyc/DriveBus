@@ -1,21 +1,25 @@
 #include "../include/fd_helpers.hpp"
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
-void set_fd_nonblocking(int fd) {
+bool set_fd_nonblocking(int fd) {
     int old_option = fcntl(fd, F_GETFL);
+    if (old_option < 0) return false;
+
     int new_option = old_option | O_NONBLOCK;
-    fcntl(fd, F_SETFL, new_option);
+    return fcntl(fd, F_SETFL, new_option) == 0;
 }
 
-void add_fd_to_epoll(int epoll_fd, int fd) {
+bool add_fd_to_epoll(int epoll_fd, int fd) {
     epoll_event event{};
     event.data.fd = fd;
     event.events = EPOLLET | EPOLLIN;
-    set_fd_nonblocking(fd);
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event);
+    if (!set_fd_nonblocking(fd)) return false;
+
+    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) == 0;
 }
 
 bool is_valid_scm_rights_cmsg(cmsghdr *cmsg) {
@@ -93,11 +97,20 @@ ssize_t receive_packet_with_fd(int conn_fd, void *packet, size_t packet_size, in
     msg.msg_controllen = sizeof(control);
 
     ssize_t n = recvmsg(conn_fd, &msg, 0);
-    if (n < 0) return -1;
+    if (n <= 0) return n;
+    if (msg.msg_flags & MSG_CTRUNC) {
+        errno = EMSGSIZE;
+        return -1;
+    }
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg == nullptr) return -1;
-    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+    if (cmsg == nullptr ||
+        cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_RIGHTS ||
+        cmsg->cmsg_len != CMSG_LEN(sizeof(received_fd))) {
+        errno = EPROTO;
+        return -1;
+    }
 
     memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
     return n;
