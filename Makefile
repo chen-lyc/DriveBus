@@ -14,7 +14,7 @@ CPPFLAGS += -DENABLE_DEBUG_CHECKS
 endif
 
 HEADERS := $(wildcard include/*.h include/*.hpp)
-TARGETS := a.out b.out broker.out broker-status
+TARGETS := broker.out broker-status pub_node sub_node
 
 .PHONY: all rebuild
 
@@ -25,14 +25,14 @@ all: $(TARGETS)
 rebuild:
 	$(MAKE) -B all
 
-a.out: a.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) a.cpp src/fd_helpers.cpp src/logger.cpp -o $@
-
-b.out: b.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) b.cpp src/fd_helpers.cpp src/logger.cpp -o $@
-
 broker.out: broker.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker.cpp src/fd_helpers.cpp src/logger.cpp -o $@
 
 broker-status: broker_status_cli.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) broker_status_cli.cpp -o $@
+
+pub_node: pub_node.cpp src/publisher.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) pub_node.cpp src/publisher.cpp src/fd_helpers.cpp src/logger.cpp -o $@
+
+sub_node: sub_node.cpp src/subscriber.cpp src/fd_helpers.cpp src/logger.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) sub_node.cpp src/subscriber.cpp src/fd_helpers.cpp src/logger.cpp -o $@

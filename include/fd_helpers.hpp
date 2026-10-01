@@ -7,6 +7,13 @@
 bool set_fd_nonblocking(int fd);
 bool add_fd_to_epoll(int epoll_fd, int fd);
 
+inline void close_fd(int &fd) {
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
+    }
+}
+
 bool is_valid_scm_rights_cmsg(cmsghdr *cmsg);
 
 ssize_t send_packet_with_fd(int conn_fd, void *packet, size_t packet_size, int fd_to_send);
