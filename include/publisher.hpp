@@ -3,10 +3,17 @@
 #include "broker_protocol.hpp"
 #include "shared_memory_layout.hpp"
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <future>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -17,6 +24,10 @@ inline constexpr size_t kMaxEvents = 1024;
 
 class Publisher {
   public:
+    using Flags = uint32_t;
+    inline static constexpr Flags SYNCHRONOUS = 1U << 0;
+    inline static constexpr Flags ASYNCHRONOUS = 1U << 1;
+
     enum class CreateError {
         SharedMemoryUnlinkFailed,
         SharedMemoryOpenFailed,
@@ -32,6 +43,11 @@ class Publisher {
         PublishWorkEventFdCreateFailed,
         PublishWorkEpollAddFailed,
         PublishWorkInitialSignalFailed,
+        ShutdownEventFdCreateFailed,
+        ShutdownEpollAddFailed,
+        WorkerExitEventFdCreateFailed,
+        RunThreadCreateFailed,
+        PublisherModeFlagsInvalid,
         InitialSubscriberCountReceiveFailed,
         InitialSubscriberRegistrationReceiveFailed,
         InitialSubscriberRegistrationEventFdMissing,
@@ -64,19 +80,62 @@ class Publisher {
         DynamicSubscriberRegistrationFailed,
         PublishWorkBrokerResumeFailed,
         DataAvailableSignalFailed,
+        ShutdownEventReadFailed,
     };
+
+    enum class PublishDisposition {
+        Published,
+        Enqueued,
+        EnqueuedAfterOverwritingOldest,
+    };
+
+    enum class PublishError {
+        ModeMismatch,
+        PayloadTooLarge,
+        WorkerExited,
+        NotificationFailed,
+        Timeout,
+        EventWaitFailed,
+        BrokerUnavailable,
+        DataPathFailed,
+    };
+
+    enum class PublishCompletion {
+        Published,
+        Overwritten,
+        WorkerStopped,
+        WorkerFailed,
+    };
+
+    struct PublishTicket {
+        PublishDisposition disposition;
+        std::shared_future<PublishCompletion> future;
+    };
+
+    using PublishResult = std::variant<PublishTicket, PublishError>;
 
     struct CreateResult;
 
-    static CreateResult create(TopicId topic_id, const char *shm_name);
+    static CreateResult create(TopicId topic_id,
+        const char *shm_name,
+        Flags publisher_flags = SYNCHRONOUS);
 
     Publisher(const Publisher &) = delete;
     Publisher &operator=(const Publisher &) = delete;
 
-    Publisher(Publisher &&other) noexcept;
-    Publisher &operator=(Publisher &&other) noexcept;
+    Publisher(Publisher &&other);
+    Publisher &operator=(Publisher &&other);
 
-    RunError run();
+    PublishResult publish(std::span<const std::byte> payload, std::chrono::microseconds timeout);
+    PublishResult publish(std::span<const std::byte> payload);
+
+    std::shared_future<RunError> worker_exit_future() {
+        return worker_exit_future_;
+    }
+
+    int worker_exit_event_fd() const {
+        return worker_exit_event_fd_;
+    }
 
     ~Publisher();
 
@@ -99,21 +158,49 @@ class Publisher {
         int epoll_fd = -1;
         int space_available_event_fd = -1;
         int publish_work_event_fd = -1;
+        int shutdown_event_fd = -1;
+        int worker_exit_event_fd = -1;
     };
-
-    explicit Publisher(InitialResources resources);
-
-    void release_resources();
-    void take_resources_from(Publisher &&other);
-
-    std::variant<SubscriberRegistration, CreateError> receive_subscriber_registration();
-    std::optional<SubscriberTrackingError> track_subscriber(SubscriberRegistration registration);
-    std::optional<CreateError> receive_and_track_initial_subscriber_registrations();
 
     enum class PublishReadiness {
         Ready,
         Blocked,
+        NoMessage,
     };
+
+    struct PendingMessage {
+        std::vector<std::byte> payload;
+        std::promise<PublishCompletion> completion_promise;
+
+        PendingMessage(std::span<const std::byte> bytes) : payload(bytes.begin(), bytes.end()) {};
+    };
+
+    enum class InFlightState {
+        Publishing,
+        Blocked,
+    };
+
+    struct InFlightMessage {
+        PendingMessage message;
+        InFlightState state;
+    };
+
+    enum class WorkerStopIntent {
+        Destroy,
+        Transfer,
+    };
+
+    explicit Publisher(InitialResources resources, Flags publisher_flags);
+
+    void release_resources();
+    void take_resources_from(Publisher &&other);
+    void reset_worker_exit_notification();
+    void start_run_thread();
+    bool stop_run_thread(WorkerStopIntent stop_intent);
+
+    std::variant<SubscriberRegistration, CreateError> receive_subscriber_registration();
+    std::optional<SubscriberTrackingError> track_subscriber(SubscriberRegistration registration);
+    std::optional<CreateError> receive_and_track_initial_subscriber_registrations();
 
     uint32_t find_slowest_read_index();
 
@@ -124,15 +211,30 @@ class Publisher {
     RunError process_broker_control_messages();
 
     std::variant<PublishReadiness, RunError> can_publish_next_message();
-    std::variant<PublishAttempt, RunError> try_publish_one();
+    std::variant<PublishAttempt, RunError> try_publish_one(std::span<const std::byte> payload);
     RunError handle_publish_work_event(bool &publisher_ready);
     RunError handle_space_available_event(bool &publisher_ready);
     RunError handle_broker_control_event(bool &publisher_ready);
+
+    RunError run();
 
     std::vector<int> data_available_event_fds_{};
 
     std::unordered_map<int, size_t> subscriber_slot_index_by_data_available_event_fd_{};
     std::array<int, kMaxSubscribers> data_available_event_fd_by_subscriber_slot_index_{};
+
+    Flags flags_ = SYNCHRONOUS;
+
+    std::thread run_thread_;
+    std::atomic<bool> run_thread_active_{false};
+    std::promise<RunError> worker_exit_promise_;
+    std::shared_future<RunError> worker_exit_future_;
+    WorkerStopIntent worker_stop_intent_ = WorkerStopIntent::Destroy;
+
+    std::deque<PendingMessage> pending_messages_;
+    std::mutex publish_state_mutex_;
+
+    std::optional<InFlightMessage> in_flight_message_;
 
     std::string shm_name_;
     SharedData *shared_data_;
@@ -141,14 +243,15 @@ class Publisher {
     int epoll_fd_ = -1;
     int space_available_event_fd_ = -1;
     int publish_work_event_fd_ = -1;
+    int shutdown_event_fd_ = -1;
+    int worker_exit_event_fd_ = -1;
 
-    int task_num_ = 26 * 3000;
     int seq_ = 0;
 
-    uint32_t next_message_size_bytes_;
-
-    char fill_character_ = 'a';
-
+    static constexpr size_t kMessageHeaderSizeBytes = 2 * sizeof(int);
+    static constexpr size_t kMaxPayloadSizeBytes =
+        kClassSizeBytes[kClassCount - 1] - kMessageHeaderSizeBytes;
+    static constexpr size_t kMaxOutstandingMessages = 64;
     static constexpr size_t kMaxPublishesPerWorkEvent = 64;
 };
 
