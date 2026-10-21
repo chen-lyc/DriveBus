@@ -4,6 +4,47 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <utility>
+
+FdGuard::~FdGuard() noexcept {
+    if (fd_ != nullptr) {
+        const int saved_errno = errno;
+        close_fd(*fd_);
+        errno = saved_errno;
+    }
+}
+
+int FdGuard::release() noexcept {
+    if (fd_ == nullptr) return -1;
+    int fd = std::exchange(*fd_, -1);
+    fd_ = nullptr;
+    return fd;
+}
+
+ReceivedFdsGuard::~ReceivedFdsGuard() noexcept {
+    close_received_fds(message_);
+}
+
+void close_received_fds(msghdr &message) noexcept {
+    const int saved_errno = errno;
+
+    cmsghdr *cmsg = CMSG_FIRSTHDR(&message);
+
+    if (cmsg != nullptr && is_valid_scm_rights_cmsg(cmsg)) {
+        const size_t fd_bytes = cmsg->cmsg_len - CMSG_LEN(0);
+        if (fd_bytes % sizeof(int) != 0) {
+            return;
+        }
+
+        int *received_fds = reinterpret_cast<int *>(CMSG_DATA(cmsg));
+        const size_t fd_count = fd_bytes / sizeof(int);
+        for (size_t fd_index = 0; fd_index < fd_count; ++fd_index) {
+            close(received_fds[fd_index]);
+        }
+    }
+
+    errno = saved_errno;
+}
 
 bool set_fd_nonblocking(int fd) {
     int old_option = fcntl(fd, F_GETFL);
@@ -51,7 +92,7 @@ ssize_t send_packet_with_fd(int conn_fd, void *packet, size_t packet_size, int f
 
     *reinterpret_cast<int *>(CMSG_DATA(cmsg)) = fd_to_send;
 
-    return sendmsg(conn_fd, &msg, 0);
+    return sendmsg(conn_fd, &msg, MSG_NOSIGNAL);
 }
 
 ssize_t send_packet_with_fds(int conn_fd, void *packet, size_t packet_size, const std::vector<int> &fds_to_send) {
@@ -78,7 +119,7 @@ ssize_t send_packet_with_fds(int conn_fd, void *packet, size_t packet_size, cons
         memcpy(CMSG_DATA(cmsg), fds_to_send.data(), len);
     }
 
-    return sendmsg(conn_fd, &msg, 0);
+    return sendmsg(conn_fd, &msg, MSG_NOSIGNAL);
 }
 
 ssize_t receive_packet_with_fd(int conn_fd, void *packet, size_t packet_size, int &received_fd) {
@@ -97,8 +138,10 @@ ssize_t receive_packet_with_fd(int conn_fd, void *packet, size_t packet_size, in
     msg.msg_controllen = sizeof(control);
 
     ssize_t n = recvmsg(conn_fd, &msg, 0);
-    if (n <= 0) return n;
-    if (msg.msg_flags & MSG_CTRUNC) {
+    if (n < 0) return n;
+    ReceivedFdsGuard received_fds(msg);
+    if (n == 0) return n;
+    if (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) {
         errno = EMSGSIZE;
         return -1;
     }
@@ -112,6 +155,7 @@ ssize_t receive_packet_with_fd(int conn_fd, void *packet, size_t packet_size, in
         return -1;
     }
 
-    memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
+    int *fd = reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    received_fd = std::exchange(*fd, -1);
     return n;
 }

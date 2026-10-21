@@ -2,8 +2,13 @@
 #include "../include/logger.h"
 #include "../include/shared_memory_layout_helpers.hpp"
 #include "../include/fd_helpers.hpp"
+#include <algorithm>
+#include <cassert>
+#include <exception>
 #include <filesystem>
+#include <limits>
 #include <optional>
+#include <system_error>
 #include <utility>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -12,6 +17,50 @@
 #include <sys/un.h>
 
 namespace {
+constexpr AttachmentId kBrokerEventId = 0;
+constexpr AttachmentId kShutdownEventId = std::numeric_limits<AttachmentId>::max();
+
+class TransferEventDrainError : public std::system_error {
+  public:
+    explicit TransferEventDrainError(int error)
+        : std::system_error(error, std::generic_category(), "Subscriber transfer event drain") {}
+};
+
+bool add_fd_to_epoll(const int epoll_fd, const int fd, const uint64_t event_id) {
+    epoll_event event{};
+    event.data.u64 = event_id;
+    event.events = EPOLLET | EPOLLIN;
+    if (!set_fd_nonblocking(fd)) return false;
+
+    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) == 0;
+}
+
+Subscriber::SubscribeError map_run_error_to_subscribe_error(
+    const Subscriber::RunError run_error) {
+    assert(run_error != Subscriber::RunError::None);
+    switch (run_error) {
+        case Subscriber::RunError::None:
+            std::terminate();
+        case Subscriber::RunError::EpollWaitFailed:
+            return Subscriber::SubscribeError::EventWaitFailed;
+        case Subscriber::RunError::UnexpectedEpollTimeout:
+            return Subscriber::SubscribeError::Timeout;
+        case Subscriber::RunError::BrokerControlMessageProcessingFailed:
+        case Subscriber::RunError::PublisherDisconnectedPayloadSizeMismatch:
+        case Subscriber::RunError::PublisherDisconnectedAttachmentMissing:
+        case Subscriber::RunError::PublisherDisconnectedEventFdMissing:
+            return Subscriber::SubscribeError::BrokerUnavailable;
+        case Subscriber::RunError::DataAvailableEventAttachmentMissing:
+        case Subscriber::RunError::DataAvailableEventReadFailed:
+        case Subscriber::RunError::WrappedDescriptorReadFailed:
+        case Subscriber::RunError::ContiguousMessageConsumptionFailed:
+        case Subscriber::RunError::ShutdownEventReadFailed:
+        case Subscriber::RunError::WorkerException:
+            return Subscriber::SubscribeError::DataPathFailed;
+    }
+    return Subscriber::SubscribeError::DataPathFailed;
+}
+
 std::filesystem::path subscriber_log_path() {
     const char *run_id_env = std::getenv("DRIVEBUS_RUN_ID");
     const std::string run_id = run_id_env != nullptr && *run_id_env != '\0' ? run_id_env : "standalone";
@@ -56,7 +105,9 @@ std::variant<int, Subscriber::CreateError> connect_to_broker() {
     return broker_fd;
 }
 
-std::optional<Subscriber::CreateError> send_subscriber_topic_registration(const int broker_fd, std::span<const TopicId> topic_ids) {
+std::optional<Subscriber::CreateError> send_subscriber_topic_registration(
+    const int broker_fd,
+    std::span<const TopicId> topic_ids) {
     char packet[kSubscriberTopicRegistrationMessageSize]{};
     BrokerMessageType type = BrokerMessageType::SubscriberTopicRegistration;
     memcpy(packet, &type, sizeof(BrokerMessageType));
@@ -79,7 +130,7 @@ std::optional<Subscriber::CreateError> send_subscriber_topic_registration(const 
             sizeof(topic_id));
     }
 
-    const ssize_t registration_sent_size = send(broker_fd, packet, sizeof(packet), 0);
+    const ssize_t registration_sent_size = send(broker_fd, packet, sizeof(packet), MSG_NOSIGNAL);
     if (registration_sent_size != static_cast<ssize_t>(sizeof(packet))) {
         LOG_ERROR("SubscriberRegistrationSendError: expected=%zu actual=%zd errno=%d (%s)",
             sizeof(packet),
@@ -92,10 +143,21 @@ std::optional<Subscriber::CreateError> send_subscriber_topic_registration(const 
 }
 } // namespace
 
-Subscriber::CreateResult Subscriber::create(std::span<const TopicId> topic_ids) {
+Subscriber::CreateResult Subscriber::create(std::span<const TopicId> topic_ids, Flags flags, std::function<void(char *, size_t)> callback) {
     Logger::init(subscriber_log_path());
 
+    const Flags execution_mode_flags = flags & (SYNCHRONOUS | ASYNCHRONOUS);
+    if (execution_mode_flags != SYNCHRONOUS && execution_mode_flags != ASYNCHRONOUS) {
+        LOG_ERROR("SubscriberModeFlagsInvalidError: flags=%u mode_flags=%u", flags, execution_mode_flags);
+        return CreateResult{CreateError::SubscriberModeFlagsInvalid};
+    }
+    if (execution_mode_flags == ASYNCHRONOUS && !callback) {
+        LOG_ERROR("SubscriberAsyncCallbackMissingError");
+        return CreateResult{CreateError::AsyncCallbackMissing};
+    }
+
     int epoll_fd = epoll_create1(0);
+    FdGuard epoll_guard(epoll_fd);
     if (epoll_fd < 0) {
         LOG_ERROR("SubscriberEpollCreateError: errno=%d (%s)", errno, strerror(errno));
         return CreateResult{CreateError::EpollCreateFailed};
@@ -104,40 +166,87 @@ Subscriber::CreateResult Subscriber::create(std::span<const TopicId> topic_ids) 
     auto connect_result = connect_to_broker();
     auto *connect_error = std::get_if<CreateError>(&connect_result);
     if (connect_error != nullptr) {
-        close_fd(epoll_fd);
         return CreateResult{*connect_error};
     }
 
     int broker_fd = get<int>(connect_result);
+    FdGuard broker_guard(broker_fd);
 
     auto registration_result = send_subscriber_topic_registration(broker_fd, topic_ids);
     if (registration_result.has_value()) {
         LOG_ERROR("SubscriberTopicRegistrationCreateError: topic_count=%zu", topic_ids.size());
-        close_fd(epoll_fd);
-        close_fd(broker_fd);
         return CreateResult{*registration_result};
     }
-    // 阻塞等待
-
-    if (!add_fd_to_epoll(epoll_fd, broker_fd)) {
+    if (!add_fd_to_epoll(epoll_fd, broker_fd, kBrokerEventId)) {
         LOG_ERROR("SubscriberBrokerEpollAddError: epoll_fd=%d broker_fd=%d errno=%d (%s)",
             epoll_fd,
             broker_fd,
             errno,
             strerror(errno));
-        close_fd(epoll_fd);
-        close_fd(broker_fd);
         return CreateResult{CreateError::BrokerEpollRegistrationFailed};
     }
 
-    return CreateResult{Subscriber(epoll_fd, broker_fd)};
+    int shutdown_event_fd = -1;
+    FdGuard shutdown_guard(shutdown_event_fd);
+    int worker_exit_event_fd = -1;
+    FdGuard worker_exit_guard(worker_exit_event_fd);
+    if (execution_mode_flags == ASYNCHRONOUS) {
+        shutdown_event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (shutdown_event_fd < 0) {
+            LOG_ERROR("SubscriberShutdownEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
+            return CreateResult{CreateError::ShutdownEventFdCreateFailed};
+        }
+        if (!add_fd_to_epoll(epoll_fd, shutdown_event_fd, kShutdownEventId)) {
+            LOG_ERROR("SubscriberShutdownEpollRegistrationError: epoll_fd=%d event_fd=%d errno=%d (%s)",
+                epoll_fd,
+                shutdown_event_fd,
+                errno,
+                strerror(errno));
+            return CreateResult{CreateError::ShutdownEpollRegistrationFailed};
+        }
+
+        worker_exit_event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (worker_exit_event_fd < 0) {
+            LOG_ERROR("SubscriberWorkerExitEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
+            return CreateResult{CreateError::WorkerExitEventFdCreateFailed};
+        }
+    }
+
+    InitialResources resources{
+        .epoll_fd = epoll_fd,
+        .broker_fd = broker_fd,
+        .shutdown_event_fd = shutdown_event_fd,
+        .worker_exit_event_fd = worker_exit_event_fd,
+    };
+    Subscriber subscriber(resources, flags, std::move(callback));
+    epoll_guard.release();
+    broker_guard.release();
+    shutdown_guard.release();
+    worker_exit_guard.release();
+
+    try {
+        CreateResult result{std::move(subscriber)};
+        Subscriber &created_subscriber = std::get<Subscriber>(result.value);
+        if (execution_mode_flags == ASYNCHRONOUS) {
+            created_subscriber.start_run_thread();
+        }
+        return result;
+    } catch (const TransferEventDrainError &) {
+        return CreateResult{CreateError::TransferEventDrainFailed};
+    } catch (const std::system_error &error) {
+        LOG_ERROR("SubscriberRunThreadCreateError: %s", error.what());
+        return CreateResult{CreateError::RunThreadCreateFailed};
+    }
 }
 
-Subscriber::Subscriber(Subscriber &&other) noexcept {
+// 移动/析构时不得并发调用成员函数，也不得从本对象的回调中执行。
+// 移动可能因通知清理或 worker 重启失败抛出 std::system_error（含派生异常）。
+// 内存分配失败也可能抛出 std::bad_alloc，因此移动操作不保证 noexcept。
+Subscriber::Subscriber(Subscriber &&other) {
     take_resources_from(std::move(other));
 }
 
-Subscriber &Subscriber::operator=(Subscriber &&other) noexcept {
+Subscriber &Subscriber::operator=(Subscriber &&other) {
     if (this != &other) {
         release_resources();
         take_resources_from(std::move(other));
@@ -149,11 +258,45 @@ Subscriber::~Subscriber() {
     release_resources();
 }
 
-Subscriber::Subscriber(int epoll_fd, int broker_fd) : epoll_fd_(epoll_fd), broker_fd_(broker_fd) {}
+Subscriber::Subscriber(
+    InitialResources resources,
+    Flags flags,
+    std::function<void(char *, size_t)> callback)
+    : flags_(flags),
+      epoll_fd_(resources.epoll_fd),
+      broker_fd_(resources.broker_fd),
+      shutdown_event_fd_(resources.shutdown_event_fd),
+      worker_exit_event_fd_(resources.worker_exit_event_fd),
+      callback_(std::move(callback)) {}
 
 void Subscriber::take_resources_from(Subscriber &&other) {
+    const bool restart_run_thread = other.stop_run_thread();
+    if (restart_run_thread) {
+        for (const int event_fd : {other.shutdown_event_fd_, other.worker_exit_event_fd_}) {
+            if (!drain_eventfd(event_fd)) {
+                const int saved_errno = errno;
+                LOG_ERROR("SubscriberTransferEventDrainError: event_fd=%d errno=%d (%s)",
+                    event_fd,
+                    saved_errno,
+                    strerror(saved_errno));
+                throw TransferEventDrainError(saved_errno);
+            }
+        }
+    }
+
+    flags_ = std::exchange(other.flags_, SYNCHRONOUS);
+
     epoll_fd_ = std::exchange(other.epoll_fd_, -1);
     broker_fd_ = std::exchange(other.broker_fd_, -1);
+    shutdown_event_fd_ = std::exchange(other.shutdown_event_fd_, -1);
+    worker_exit_event_fd_ = std::exchange(other.worker_exit_event_fd_, -1);
+    worker_exit_promise_ = std::move(other.worker_exit_promise_);
+    worker_exit_future_ = std::move(other.worker_exit_future_);
+    callback_ = std::move(other.callback_);
+
+    std::copy_n(other.events_, kMaxEvents, events_);
+    event_count_ = std::exchange(other.event_count_, 0);
+    event_index_ = std::exchange(other.event_index_, 0);
 
     publisher_attachment_by_data_available_event_fd_.clear();
     publisher_attachment_by_data_available_event_fd_.swap(
@@ -162,31 +305,111 @@ void Subscriber::take_resources_from(Subscriber &&other) {
     data_available_event_fd_by_attachment_id_.clear();
     data_available_event_fd_by_attachment_id_.swap(
         other.data_available_event_fd_by_attachment_id_);
+
+    try {
+        if (restart_run_thread) {
+            start_run_thread();
+        }
+    } catch (...) {
+        release_resources();
+        throw;
+    }
 }
 
 void Subscriber::release_resources() {
+    stop_run_thread();
+
     for (auto &[event_fd, attachment] : publisher_attachment_by_data_available_event_fd_) {
         release_publisher_attachment(attachment);
     }
+    publisher_attachment_by_data_available_event_fd_.clear();
+    data_available_event_fd_by_attachment_id_.clear();
 
+    close_fd(shutdown_event_fd_);
+    close_fd(worker_exit_event_fd_);
     close_fd(epoll_fd_);
     close_fd(broker_fd_);
+    event_count_ = 0;
+    event_index_ = 0;
+}
+
+void Subscriber::reset_worker_exit_notification() {
+    worker_exit_promise_ = std::promise<RunError>{};
+    worker_exit_future_ = worker_exit_promise_.get_future().share();
+}
+
+void Subscriber::start_run_thread() {
+    reset_worker_exit_notification();
+    run_thread_active_.store(true, std::memory_order_relaxed);
+    try {
+        run_thread_ = std::thread([this] {
+            RunError reason = RunError::None;
+            try {
+                reason = run();
+            } catch (const std::exception &error) {
+                reason = RunError::WorkerException;
+                LOG_ERROR("SubscriberWorkerException: %s", error.what());
+            } catch (...) {
+                reason = RunError::WorkerException;
+                LOG_ERROR("SubscriberWorkerException: unknown exception");
+            }
+            worker_exit_promise_.set_value(reason);
+
+            if (!signal_eventfd(worker_exit_event_fd_)) {
+                LOG_ERROR("SubscriberWorkerExitSignalError: event_fd=%d errno=%d (%s)",
+                    worker_exit_event_fd_,
+                    errno,
+                    strerror(errno));
+            }
+            run_thread_active_.store(false, std::memory_order_relaxed);
+        });
+    } catch (...) {
+        run_thread_active_.store(false, std::memory_order_relaxed);
+        throw;
+    }
+}
+
+bool Subscriber::stop_run_thread() {
+    if (!run_thread_.joinable()) {
+        return false;
+    }
+
+    const bool was_active = run_thread_active_.load(std::memory_order_relaxed);
+    if (was_active) {
+        if (!signal_eventfd(shutdown_event_fd_)) {
+            LOG_ERROR("SubscriberShutdownEventWriteError: event_fd=%d errno=%d (%s)",
+                shutdown_event_fd_,
+                errno,
+                strerror(errno));
+        }
+    }
+
+    run_thread_.join();
+    return was_active &&
+        worker_exit_future_.valid() &&
+        worker_exit_future_.get() == RunError::None;
 }
 
 void Subscriber::release_publisher_attachment(PublisherAttachment &attachment) {
-    if (attachment.data_available_event_fd > 0)
+    if (attachment.data_available_event_fd >= 0)
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, attachment.data_available_event_fd, nullptr);
 
-    if (attachment.shared_data != MAP_FAILED)
+    if (attachment.shared_data != nullptr && attachment.shared_data != MAP_FAILED)
         munmap(attachment.shared_data, sizeof(SharedData));
+    attachment.shared_data = nullptr;
 
     close_fd(attachment.shm_fd);
     close_fd(attachment.space_available_event_fd);
     close_fd(attachment.data_available_event_fd);
 }
 
-bool Subscriber::read_data(PublisherAttachment &publisher_attachment, MessageDescriptor desc_ring[], const size_t descriptor_count) {
+std::variant<Subscriber::MessageBatch, Subscriber::RunError> Subscriber::read_data(
+    PublisherAttachment &publisher_attachment,
+    MessageDescriptor desc_ring[],
+    const size_t descriptor_count) {
     SharedData *p = publisher_attachment.shared_data;
+    MessageBatch messages;
+
     for (size_t descriptor_index = 0; descriptor_index < descriptor_count; ++descriptor_index) {
         uint32_t offset = desc_ring[descriptor_index].offset;
         uint32_t message_size_bytes = desc_ring[descriptor_index].len;
@@ -197,13 +420,13 @@ bool Subscriber::read_data(PublisherAttachment &publisher_attachment, MessageDes
                 publisher_attachment.expected_seq,
                 descriptor_index,
                 message_size_bytes);
-            return false;
+            return RunError::ContiguousMessageConsumptionFailed;
         }
 
 #ifdef ENABLE_DEBUG_CHECKS
         if (offset < kFirstOffset[size_class] || offset > kLastOffset[size_class]) {
             LOG_FATAL("SubscriberChunkOffsetError: class=%d, offset=%u", size_class, offset);
-            return false;
+            return RunError::ContiguousMessageConsumptionFailed;
         }
 #endif
 
@@ -213,7 +436,7 @@ bool Subscriber::read_data(PublisherAttachment &publisher_attachment, MessageDes
                 descriptor_index,
                 message_size_bytes,
                 2 * sizeof(int));
-            return false;
+            return RunError::ContiguousMessageConsumptionFailed;
         }
 
         int magic, seq;
@@ -236,12 +459,15 @@ bool Subscriber::read_data(PublisherAttachment &publisher_attachment, MessageDes
                 seq);
             is_error = true;
         }
-        if (is_error) return false;
-        if (message_size_bytes > 2 * sizeof(int)) {
-            write(1, p->data + offset + 2 * sizeof(int), message_size_bytes - 2 * sizeof(int));
+        if (is_error) return RunError::ContiguousMessageConsumptionFailed;
+
+        if (flags_ & SYNCHRONOUS) {
+            auto bytes = std::as_bytes(
+                std::span{p->data + offset + 2 * sizeof(int), message_size_bytes - 2 * sizeof(int)});
+            messages.emplace_back(bytes.begin(), bytes.end());
+        } else {
+            callback_(p->data + offset + 2 * sizeof(int), message_size_bytes - 2 * sizeof(int));
         }
-        // 方便观察输出，可删
-        printf("\n");
 
         ++publisher_attachment.expected_seq;
 
@@ -269,7 +495,7 @@ bool Subscriber::read_data(PublisherAttachment &publisher_attachment, MessageDes
                         chunk_index,
                         offset);
                     pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
-                    return false;
+                    return RunError::ContiguousMessageConsumptionFailed;
                 }
                 p->chunk_usage_tracker.is_in_use[size_class][chunk_index] = false;
 
@@ -281,31 +507,105 @@ bool Subscriber::read_data(PublisherAttachment &publisher_attachment, MessageDes
             memcpy(p->data + last_tail_off, &offset, sizeof(uint32_t));
             p->tail.offset[size_class].store(offset, std::memory_order_release);
 
-            if (eventfd_write(publisher_attachment.space_available_event_fd, 1) < 0) {
+            if (!signal_eventfd(publisher_attachment.space_available_event_fd)) {
                 LOG_ERROR("SubscriberSpaceAvailableSignalError: event_fd=%d errno=%d (%s)",
                     publisher_attachment.space_available_event_fd,
                     errno,
                     strerror(errno));
-                return false;
+                return RunError::ContiguousMessageConsumptionFailed;
             }
         }
     }
-    return true;
+    return messages;
 }
 
-bool Subscriber::consume_contiguous_messages(PublisherAttachment &publisher_attachment) {
+std::variant<Subscriber::MessageBatch, Subscriber::RunError> Subscriber::consume_contiguous_messages(
+    PublisherAttachment &publisher_attachment) {
     SharedData *p = publisher_attachment.shared_data;
+    MessageBatch messages;
 
     uint32_t wr = p->descriptor_write_index.load(std::memory_order_acquire);
     while (wr > publisher_attachment.subscriber_read_index) {
         std::vector<MessageDescriptor> desc_ring(p->desc_ring + publisher_attachment.subscriber_read_index, p->desc_ring + wr);
 
-        if (!read_data(publisher_attachment, desc_ring.data(), desc_ring.size())) {
-            return false;
+        auto read_result = read_data(publisher_attachment, desc_ring.data(), desc_ring.size());
+        if (const auto *read_error = std::get_if<RunError>(&read_result)) {
+            return *read_error;
+        }
+        auto &read_messages = std::get<MessageBatch>(read_result);
+        if (messages.empty()) {
+            messages = std::move(read_messages);
+        } else {
+            for (Message &message : read_messages) {
+                messages.emplace_back(std::move(message));
+            }
         }
         wr = p->descriptor_write_index.load(std::memory_order_acquire);
     }
-    return true;
+    return messages;
+}
+
+void Subscriber::initialize_subscriber_read_index(PublisherAttachment &publisher_attachment) {
+    if (publisher_attachment.subscriber_read_index == kInvalidIndex)
+        publisher_attachment.subscriber_read_index = publisher_attachment.shared_data
+                                                         ->descriptor_read_indices[publisher_attachment.slot_index]
+                                                         .load(std::memory_order_relaxed);
+}
+
+std::variant<Subscriber::MessageBatch, Subscriber::RunError> Subscriber::handle_data_available_event(
+    const int event_fd) {
+    auto publisher_attachment_it = publisher_attachment_by_data_available_event_fd_.find(event_fd);
+    if (publisher_attachment_it == publisher_attachment_by_data_available_event_fd_.end()) {
+        LOG_FATAL("SubscriberEventFdAttachmentMissingError: data_available_event_fd=%d", event_fd);
+        return RunError::DataAvailableEventAttachmentMissing;
+    }
+    PublisherAttachment &publisher_attachment = publisher_attachment_it->second;
+    MessageBatch messages;
+
+    if (!drain_eventfd(event_fd)) {
+        LOG_ERROR("SubscriberDataAvailableEventReadError: event_fd=%d errno=%d (%s)",
+            event_fd,
+            errno,
+            strerror(errno));
+        return RunError::DataAvailableEventReadFailed;
+    }
+
+    initialize_subscriber_read_index(publisher_attachment);
+
+    uint32_t wr = publisher_attachment.shared_data->descriptor_write_index.load(std::memory_order_acquire);
+    LOG_DEBUG("descriptor indices: wr=%u rd=%u", wr, publisher_attachment.subscriber_read_index);
+
+    if (publisher_attachment.subscriber_read_index > wr) {
+        const size_t descriptor_count = static_cast<size_t>(
+            kDescriptorSlotCount - publisher_attachment.subscriber_read_index);
+
+        std::vector<MessageDescriptor> desc_ring(descriptor_count);
+        std::copy(publisher_attachment.shared_data->desc_ring + publisher_attachment.subscriber_read_index,
+            publisher_attachment.shared_data->desc_ring + kDescriptorSlotCount,
+            desc_ring.data());
+
+        auto read_result = read_data(publisher_attachment, desc_ring.data(), descriptor_count);
+        if (std::holds_alternative<RunError>(read_result)) {
+            return RunError::WrappedDescriptorReadFailed;
+        }
+        messages = std::get<MessageBatch>(std::move(read_result));
+    }
+
+    auto consume_result = consume_contiguous_messages(publisher_attachment);
+    if (const auto *consume_error = std::get_if<RunError>(&consume_result)) {
+        return *consume_error;
+    }
+    auto &consume_messages = std::get<MessageBatch>(consume_result);
+    if (messages.empty()) {
+        messages = std::move(consume_messages);
+    } else {
+        for (Message &message : consume_messages) {
+            messages.emplace_back(std::move(message));
+        }
+    }
+
+    LOG_DEBUG("subscriber event processed: data_available_event_fd=%d", event_fd);
+    return messages;
 }
 
 bool Subscriber::process_broker_control_messages() {
@@ -327,17 +627,23 @@ bool Subscriber::process_broker_control_messages() {
 
         const ssize_t received_size = recvmsg(broker_fd_, &msg, 0);
 
-        if (received_size == 0) {
-            LOG_ERROR("broker control connection closed: broker_fd=%d", broker_fd_);
-            return false;
-        } else if (received_size < 0) {
+        if (received_size < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
                 LOG_ERROR("broker control recv failed: fd=%d errno=%d (%s)", broker_fd_, errno, strerror(errno));
                 return false;
             }
-        } else if (msg.msg_flags & MSG_CTRUNC || msg.msg_flags & MSG_TRUNC) {
+        }
+        ReceivedFdsGuard received_fds(msg);
+        // install_subscriber_attachment_batch insert/emplace 分配内存时可能抛出 std::bad_alloc
+        // 内存问题应及时反馈给上层，所以选择守护类关闭剩余资源
+
+        if (received_size == 0) {
+            LOG_ERROR("broker control connection closed: broker_fd=%d", broker_fd_);
+            return false;
+        }
+        if (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) {
             LOG_FATAL("MsgTruncatedError");
             return false;
         }
@@ -360,7 +666,7 @@ bool Subscriber::process_broker_control_messages() {
                 break;
             }
             case BrokerMessageType::PublisherDisconnected: {
-                handle_publisher_disconnected(packet, body_len);
+                if (handle_publisher_disconnected(packet, body_len) != RunError::None) return false;
                 break;
             }
             default: {
@@ -416,9 +722,9 @@ bool Subscriber::install_subscriber_attachment_batch(const char packet[], size_t
         return false;
     }
 
-    const int *fds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+    int *fds = reinterpret_cast<int *>(CMSG_DATA(cmsg));
     // SCM_RIGHTS 的控制数据按连续的 int 文件描述符数组存放，
-    // 因此这里可将 CMSG_DATA 返回的原始数据地址按 const int* 解释。
+    // 接管 FD 时将对应项置为 -1，接收守卫只关闭尚未交接的项。
 
     size_t packet_offset = sizeof(BrokerMessageType);
 
@@ -435,52 +741,62 @@ bool Subscriber::install_subscriber_attachment_batch(const char packet[], size_t
         memcpy(&attachment.slot_index, packet + packet_offset, sizeof(attachment.slot_index));
         packet_offset += sizeof(attachment.slot_index);
 
-        attachment.shm_fd = fds[3 * attachment_index];
-        attachment.space_available_event_fd = fds[3 * attachment_index + 1];
-        attachment.data_available_event_fd = fds[3 * attachment_index + 2];
+        attachment.shm_fd = std::exchange(fds[3 * attachment_index], -1);
+        attachment.space_available_event_fd = std::exchange(fds[3 * attachment_index + 1], -1);
+        attachment.data_available_event_fd = std::exchange(fds[3 * attachment_index + 2], -1);
 
-        attachment.shared_data = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, attachment.shm_fd, 0));
+        bool attachment_id_inserted = false;
+        try {
+            attachment.shared_data = static_cast<SharedData *>(mmap(nullptr, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, attachment.shm_fd, 0));
 
-        if (attachment.shared_data == MAP_FAILED) {
-            LOG_ERROR("SubscriberAttachmentBatchMmapError");
-            release_publisher_attachment(attachment);
-            return false;
-        }
+            if (attachment.shared_data == MAP_FAILED) {
+                LOG_ERROR("SubscriberAttachmentBatchMmapError");
+                release_publisher_attachment(attachment);
+                return false;
+            }
 
-        if (!add_fd_to_epoll(epoll_fd_, attachment.data_available_event_fd)) {
-            LOG_ERROR("SubscriberAttachmentEpollAddError: epoll_fd=%d event_fd=%d errno=%d (%s)",
-                epoll_fd_,
+            if (!add_fd_to_epoll(epoll_fd_, attachment.data_available_event_fd, attachment_id)) {
+                LOG_ERROR("SubscriberAttachmentEpollAddError: epoll_fd=%d event_fd=%d errno=%d (%s)",
+                    epoll_fd_,
+                    attachment.data_available_event_fd,
+                    errno,
+                    strerror(errno));
+                release_publisher_attachment(attachment);
+                return false;
+            }
+
+            auto attachment_id_result =
+                data_available_event_fd_by_attachment_id_.insert({attachment_id, attachment.data_available_event_fd});
+            attachment_id_inserted = attachment_id_result.second;
+
+            if (!attachment_id_inserted) {
+                LOG_FATAL("SubscriberAttachmentIdAlreadyExistsError: attachment_id=%llu",
+                    static_cast<unsigned long long>(attachment_id));
+                release_publisher_attachment(attachment);
+                return false;
+            }
+
+            auto attachment_by_event_fd_it =
+                publisher_attachment_by_data_available_event_fd_.find(attachment.data_available_event_fd);
+
+            if (attachment_by_event_fd_it != publisher_attachment_by_data_available_event_fd_.end()) {
+                LOG_FATAL("SubscriberDataAvailableEventFdAlreadyExistsError: event_fd=%d",
+                    attachment.data_available_event_fd);
+                data_available_event_fd_by_attachment_id_.erase(attachment_id_result.first);
+                release_publisher_attachment(attachment);
+                return false;
+            }
+
+            publisher_attachment_by_data_available_event_fd_.emplace(
                 attachment.data_available_event_fd,
-                errno,
-                strerror(errno));
+                std::move(attachment));
+        } catch (...) {
+            if (attachment_id_inserted) {
+                data_available_event_fd_by_attachment_id_.erase(attachment_id);
+            }
             release_publisher_attachment(attachment);
-            return false;
+            throw;
         }
-
-        auto [attachment_id_it, attachment_id_inserted] =
-            data_available_event_fd_by_attachment_id_.insert({attachment_id, attachment.data_available_event_fd});
-
-        if (!attachment_id_inserted) {
-            LOG_FATAL("SubscriberAttachmentIdAlreadyExistsError: attachment_id=%llu",
-                static_cast<unsigned long long>(attachment_id));
-            release_publisher_attachment(attachment);
-            return false;
-        }
-
-        auto attachment_by_event_fd_it =
-            publisher_attachment_by_data_available_event_fd_.find(attachment.data_available_event_fd);
-
-        if (attachment_by_event_fd_it != publisher_attachment_by_data_available_event_fd_.end()) {
-            LOG_FATAL("SubscriberDataAvailableEventFdAlreadyExistsError: event_fd=%d",
-                attachment.data_available_event_fd);
-            data_available_event_fd_by_attachment_id_.erase(attachment_id_it);
-            release_publisher_attachment(attachment);
-            return false;
-        }
-
-        publisher_attachment_by_data_available_event_fd_.emplace(
-            attachment.data_available_event_fd,
-            std::move(attachment));
     }
 
     LOG_INFO("subscriber attachment batch installed: count=%zu",
@@ -488,10 +804,10 @@ bool Subscriber::install_subscriber_attachment_batch(const char packet[], size_t
     return true;
 }
 
-bool Subscriber::handle_publisher_disconnected(const char packet[], size_t body_len) {
+Subscriber::RunError Subscriber::handle_publisher_disconnected(const char packet[], size_t body_len) {
     if (body_len != sizeof(AttachmentId)) {
         LOG_FATAL("PublisherDisconnectedPayloadSizeError: bytes=%zu", body_len);
-        return false;
+        return RunError::PublisherDisconnectedPayloadSizeMismatch;
     }
 
     AttachmentId attachment_id = kInvalidAttachmentId;
@@ -501,7 +817,7 @@ bool Subscriber::handle_publisher_disconnected(const char packet[], size_t body_
     if (data_available_event_fd_it == data_available_event_fd_by_attachment_id_.end()) {
         LOG_FATAL("PublisherDisconnectedAttachmentMissingError: attachment_id=%llu",
             static_cast<unsigned long long>(attachment_id));
-        return false;
+        return RunError::PublisherDisconnectedAttachmentMissing;
     }
 
     int data_available_event_fd = data_available_event_fd_it->second;
@@ -511,114 +827,147 @@ bool Subscriber::handle_publisher_disconnected(const char packet[], size_t body_
         LOG_FATAL("PublisherDisconnectedEventFdMissingError: attachment_id=%llu data_available_event_fd=%d",
             static_cast<unsigned long long>(attachment_id),
             data_available_event_fd);
-        return false;
+        return RunError::PublisherDisconnectedEventFdMissing;
     }
 
     release_publisher_attachment(publisher_attachment_it->second);
 
     data_available_event_fd_by_attachment_id_.erase(data_available_event_fd_it);
     publisher_attachment_by_data_available_event_fd_.erase(publisher_attachment_it);
-    return true;
-}
-
-void Subscriber::initialize_subscriber_read_index(PublisherAttachment &publisher_attachment) {
-    if (publisher_attachment.subscriber_read_index == kInvalidIndex)
-        publisher_attachment.subscriber_read_index = publisher_attachment.shared_data
-                                                         ->descriptor_read_indices[publisher_attachment.slot_index]
-                                                         .load(std::memory_order_relaxed);
-}
-
-Subscriber::RunError Subscriber::handle_data_available_event(const int event_fd) {
-    auto publisher_attachment_it = publisher_attachment_by_data_available_event_fd_.find(event_fd);
-    if (publisher_attachment_it == publisher_attachment_by_data_available_event_fd_.end()) {
-        LOG_FATAL("SubscriberEventFdAttachmentMissingError: data_available_event_fd=%d", event_fd);
-        return RunError::DataAvailableEventAttachmentMissing;
-    }
-    PublisherAttachment &publisher_attachment = publisher_attachment_it->second;
-
-    uint64_t val;
-    const ssize_t data_event_read_size = read(event_fd, &val, sizeof(val));
-    if (data_event_read_size != static_cast<ssize_t>(sizeof(val))) {
-        LOG_ERROR("SubscriberDataAvailableEventReadError: event_fd=%d expected=%zu actual=%zd errno=%d (%s)",
-            event_fd,
-            sizeof(val),
-            data_event_read_size,
-            errno,
-            strerror(errno));
-        return RunError::DataAvailableEventReadFailed;
-    }
-
-    initialize_subscriber_read_index(publisher_attachment);
-
-    uint32_t wr = publisher_attachment.shared_data->descriptor_write_index.load(std::memory_order_acquire);
-    LOG_DEBUG("descriptor indices: wr=%u rd=%u", wr, publisher_attachment.subscriber_read_index);
-
-    if (publisher_attachment.subscriber_read_index > wr) {
-        const size_t descriptor_count = static_cast<size_t>(
-            kDescriptorSlotCount - publisher_attachment.subscriber_read_index);
-
-        std::vector<MessageDescriptor> desc_ring(descriptor_count);
-        std::copy(publisher_attachment.shared_data->desc_ring + publisher_attachment.subscriber_read_index,
-            publisher_attachment.shared_data->desc_ring + kDescriptorSlotCount,
-            desc_ring.data());
-
-        if (!read_data(publisher_attachment, desc_ring.data(), descriptor_count)) {
-            return RunError::WrappedDescriptorReadFailed;
-        }
-        wr = publisher_attachment.shared_data->descriptor_write_index.load(std::memory_order_acquire);
-    }
-
-    if (!consume_contiguous_messages(publisher_attachment)) {
-        return RunError::ContiguousMessageConsumptionFailed;
-    }
-
-    LOG_DEBUG("subscriber event processed: data_available_event_fd=%d", event_fd);
     return RunError::None;
 }
 
+Subscriber::SubscribeResult Subscriber::subscribe(std::chrono::microseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (true) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return SubscribeError::Timeout;
+        }
+
+        if (event_index_ >= event_count_) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining.count() < 0) {
+                return SubscribeError::Timeout;
+            }
+
+            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+
+            const timespec wait_timeout{
+                .tv_sec = static_cast<time_t>(seconds.count()),
+                .tv_nsec = static_cast<long>((remaining - seconds).count()),
+            };
+
+            event_count_ = epoll_pwait2(epoll_fd_, events_, kMaxEvents, &wait_timeout, nullptr);
+            if (event_count_ < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                LOG_ERROR("SubscriberEpollWaitError: errno=%d (%s)", errno, strerror(errno));
+                return SubscribeError::EventWaitFailed;
+            }
+            if (event_count_ == 0) {
+                return SubscribeError::Timeout;
+            }
+            LOG_DEBUG("epoll event_count=%d", event_count_);
+
+            event_index_ = 0;
+            continue;
+        }
+
+        uint64_t event_id = events_[event_index_++].data.u64;
+
+        if (event_id == kBrokerEventId) {
+            if (!process_broker_control_messages()) {
+                return SubscribeError::BrokerUnavailable;
+            }
+            continue;
+        }
+
+        auto it = data_available_event_fd_by_attachment_id_.find(event_id);
+        if (it == data_available_event_fd_by_attachment_id_.end()) {
+            continue;
+        }
+        int fd = it->second;
+
+        auto event_result = handle_data_available_event(fd);
+        if (const auto *event_error = std::get_if<RunError>(&event_result)) {
+            return map_run_error_to_subscribe_error(*event_error);
+        }
+
+        auto messages = std::get<MessageBatch>(std::move(event_result));
+        if (messages.empty()) continue;
+
+        return messages;
+    }
+}
+
 Subscriber::RunError Subscriber::run() {
-    epoll_event events[kMaxEvents];
+    RunError reason = RunError::None;
+    bool running = true;
 
-    RunError run_error = RunError::None;
-    bool subscriber_running = true;
-
-    while (subscriber_running) {
-        int event_count = epoll_wait(epoll_fd_, events, kMaxEvents, -1);
-        if (event_count < 0) {
-            LOG_ERROR("SubscriberEpollWaitError: errno=%d (%s)", errno, strerror(errno));
-            return RunError::EpollWaitFailed;
+    while (running && reason == RunError::None) {
+        if (event_index_ >= event_count_) {
+            event_index_ = 0;
+            event_count_ = epoll_wait(epoll_fd_, events_, kMaxEvents, -1);
+            if (event_count_ < 0) {
+                LOG_ERROR("SubscriberEpollWaitError: errno=%d (%s)", errno, strerror(errno));
+                reason = RunError::EpollWaitFailed;
+                break;
+            }
+            if (event_count_ == 0) {
+                LOG_ERROR("SubscriberUnexpectedEpollTimeoutError");
+                reason = RunError::UnexpectedEpollTimeout;
+                break;
+            }
+            LOG_DEBUG("epoll event_count=%d", event_count_);
         }
-        if (event_count == 0) {
-            LOG_ERROR("SubscriberUnexpectedEpollTimeoutError");
-            return RunError::UnexpectedEpollTimeout;
-        }
-        LOG_DEBUG("epoll event_count=%d", event_count);
 
-        for (int i = 0; i < event_count; ++i) {
-            int fd = events[i].data.fd;
-            if (fd != broker_fd_) {
-                run_error = handle_data_available_event(fd);
-                if (run_error != RunError::None) {
-                    subscriber_running = false;
-                    break;
+        while (event_index_ < event_count_) {
+            const uint64_t event_id = events_[event_index_++].data.u64;
+            if (event_id == kShutdownEventId) {
+                if (!drain_eventfd(shutdown_event_fd_)) {
+                    LOG_ERROR("SubscriberShutdownEventReadError: event_fd=%d errno=%d (%s)",
+                        shutdown_event_fd_,
+                        errno,
+                        strerror(errno));
+                    reason = RunError::ShutdownEventReadFailed;
                 }
-            } else if (fd == broker_fd_) {
+                running = false;
+                break;
+            }
+
+            if (event_id == kBrokerEventId) {
                 if (!process_broker_control_messages()) {
-                    run_error = RunError::BrokerControlMessageProcessingFailed;
-                    subscriber_running = false;
+                    reason = RunError::BrokerControlMessageProcessingFailed;
+                    running = false;
                     break;
                 }
+                continue;
+            }
+
+            auto it = data_available_event_fd_by_attachment_id_.find(event_id);
+            if (it == data_available_event_fd_by_attachment_id_.end()) {
+                continue;
+            }
+
+            auto event_result = handle_data_available_event(it->second);
+            if (const auto *event_error = std::get_if<RunError>(&event_result)) {
+                reason = *event_error;
+                running = false;
+                break;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
 #ifdef ENABLE_DEBUG_CHECKS
     log_chunks_in_use();
 #endif
-    return run_error;
+    return reason;
 }
 
+#ifdef ENABLE_DEBUG_CHECKS
 void Subscriber::log_chunks_in_use() {
     for (auto &[data_available_event_fd, publisher_attachment] : publisher_attachment_by_data_available_event_fd_) {
         SharedData *p = publisher_attachment.shared_data;
@@ -638,3 +987,4 @@ void Subscriber::log_chunks_in_use() {
         pthread_mutex_unlock(&p->chunk_usage_tracker.mutex);
     }
 }
+#endif

@@ -2,11 +2,15 @@
 #include "../include/logger.h"
 #include "../include/fd_helpers.hpp"
 #include "../include/shared_memory_layout_helpers.hpp"
+#include <algorithm>
+#include <cassert>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <filesystem>
 #include <optional>
 #include <system_error>
+#include <utility>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
@@ -25,35 +29,11 @@ std::filesystem::path publisher_log_path() {
         ("pid-" + std::to_string(getpid()) + "-start-" + std::to_string(start_us) + ".log");
 }
 
-bool signal_eventfd(const int event_fd) {
-    while (eventfd_write(event_fd, 1) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN) {
-            return true;
-        }
-        return false;
-    }
-    return true;
-}
-
-bool drain_eventfd(const int event_fd) {
-    eventfd_t ignored;
-    while (eventfd_read(event_fd, &ignored) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN) {
-            return true;
-        }
-        return false;
-    }
-    return true;
-}
-
 Publisher::PublishError map_sync_run_error_to_publish_error(const Publisher::RunError run_error) {
+    assert(run_error != Publisher::RunError::None);
     switch (run_error) {
+        case Publisher::RunError::None:
+            std::terminate();
         case Publisher::RunError::SpaceAvailableEventReadFailed:
             return Publisher::PublishError::EventWaitFailed;
         case Publisher::RunError::BrokerClosed:
@@ -63,7 +43,6 @@ Publisher::PublishError map_sync_run_error_to_publish_error(const Publisher::Run
         case Publisher::RunError::ChunkReferenceReleaseFailed:
         case Publisher::RunError::DeadSubscriberReapFailed:
             return Publisher::PublishError::BrokerUnavailable;
-        case Publisher::RunError::None:
         case Publisher::RunError::EpollWaitFailed:
         case Publisher::RunError::UnexpectedEpollTimeout:
         case Publisher::RunError::PublishWorkEventReadFailed:
@@ -74,6 +53,7 @@ Publisher::PublishError map_sync_run_error_to_publish_error(const Publisher::Run
         case Publisher::RunError::PublishWorkBrokerResumeFailed:
         case Publisher::RunError::DataAvailableSignalFailed:
         case Publisher::RunError::ShutdownEventReadFailed:
+        case Publisher::RunError::WorkerException:
             return Publisher::PublishError::DataPathFailed;
     }
     return Publisher::PublishError::DataPathFailed;
@@ -139,6 +119,12 @@ std::variant<SharedDataMapping, Publisher::CreateError> create_and_map_shared_da
         LOG_ERROR("PublisherShmOpenError: name=%s errno=%d (%s)", shm_name, errno, strerror(errno));
         return Publisher::CreateError::SharedMemoryOpenFailed;
     }
+
+    auto cleanup_shm = [](const char *shm_name) {
+        shm_unlink(shm_name);
+    };
+    std::unique_ptr<const char, decltype(cleanup_shm)> shm_guard(shm_name, cleanup_shm);
+
     if (ftruncate(shm_fd, sizeof(SharedData)) < 0) {
         LOG_ERROR("PublisherShmResizeError: fd=%d bytes=%zu errno=%d (%s)",
             shm_fd,
@@ -165,6 +151,9 @@ std::variant<SharedDataMapping, Publisher::CreateError> create_and_map_shared_da
     initialize_chunk_usage_tracker(shared_data->chunk_usage_tracker);
 #endif
 
+    // 成功返回不进行 cleanup
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    shm_guard.release();
     return SharedDataMapping{shm_fd, shared_data};
 }
 
@@ -221,31 +210,12 @@ std::optional<Publisher::CreateError> send_publisher_topic_registration(int brok
     return std::nullopt;
 }
 
-void close_received_fds(cmsghdr *cmsg) {
-    if (cmsg == nullptr ||
-        cmsg->cmsg_level != SOL_SOCKET ||
-        cmsg->cmsg_type != SCM_RIGHTS ||
-        cmsg->cmsg_len < CMSG_LEN(0)) {
-        return;
-    }
-
-    const size_t fd_bytes = cmsg->cmsg_len - CMSG_LEN(0);
-    if (fd_bytes % sizeof(int) != 0) {
-        return;
-    }
-
-    int *received_fds = reinterpret_cast<int *>(CMSG_DATA(cmsg));
-    const size_t fd_count = fd_bytes / sizeof(int);
-    for (size_t fd_index = 0; fd_index < fd_count; ++fd_index) {
-        close(received_fds[fd_index]);
-    }
-}
-
 } // namespace
 
 std::variant<Publisher::SubscriberRegistration, Publisher::CreateError>
 Publisher::receive_subscriber_registration() {
     int fd = -1;
+    FdGuard fd_guard(fd);
     char packet[kSubscriberEventFdAndSlotMessageSize];
     ssize_t received_size = receive_packet_with_fd(broker_fd_, packet, sizeof(packet), fd);
     if (received_size != static_cast<ssize_t>(sizeof(packet))) {
@@ -260,7 +230,6 @@ Publisher::receive_subscriber_registration() {
                 sizeof(packet),
                 received_size);
         }
-        close_fd(fd);
         return CreateError::InitialSubscriberRegistrationReceiveFailed;
     }
     if (fd < 0) {
@@ -275,50 +244,52 @@ Publisher::receive_subscriber_registration() {
             static_cast<unsigned>(static_cast<unsigned char>(packet[0])),
             received_size,
             broker_fd_);
-        close_fd(fd);
         return CreateError::InitialSubscriberRegistrationTypeInvalid;
     }
     uint32_t received_subscriber_slot_index;
     memcpy(&received_subscriber_slot_index, packet + 1, sizeof(received_subscriber_slot_index));
 
-    return SubscriberRegistration{fd, received_subscriber_slot_index};
+    return SubscriberRegistration{fd_guard.release(), received_subscriber_slot_index};
 }
 
 std::optional<Publisher::SubscriberTrackingError>
 Publisher::track_subscriber(SubscriberRegistration registration) {
+    FdGuard registration_fd(registration.data_available_event_fd);
     if (registration.slot_index >= kMaxSubscribers) {
         LOG_ERROR("PublisherSubscriberSlotRangeError: slot=%u max=%zu data_available_event_fd=%d",
             registration.slot_index,
             kMaxSubscribers,
             registration.data_available_event_fd);
-        close_fd(registration.data_available_event_fd);
         return SubscriberTrackingError::SlotOutOfRange;
     }
     if (shared_data_->descriptor_read_indices[registration.slot_index].load(std::memory_order_relaxed) != kInvalidIndex) {
         LOG_ERROR("PublisherSubscriberSlotAlreadyTrackedError: slot=%u data_available_event_fd=%d",
             registration.slot_index,
             registration.data_available_event_fd);
-        close_fd(registration.data_available_event_fd);
         return SubscriberTrackingError::SlotAlreadyTracked;
     }
 
-    const bool event_fd_inserted =
+    const auto [event_fd_it, event_fd_inserted] =
         subscriber_slot_index_by_data_available_event_fd_
-            .insert({registration.data_available_event_fd, registration.slot_index})
-            .second;
+            .insert({registration.data_available_event_fd, registration.slot_index});
     if (!event_fd_inserted) {
         LOG_ERROR("PublisherDataAvailableEventFdAlreadyTrackedError: event_fd=%d slot=%u",
             registration.data_available_event_fd,
             registration.slot_index);
-        close_fd(registration.data_available_event_fd);
         return SubscriberTrackingError::EventFdAlreadyTracked;
     }
+    try {
+        data_available_event_fds_.emplace_back(registration.data_available_event_fd);
+    } catch (...) {
+        subscriber_slot_index_by_data_available_event_fd_.erase(event_fd_it);
+        throw;
+    }
     data_available_event_fd_by_subscriber_slot_index_[registration.slot_index] = registration.data_available_event_fd;
-    data_available_event_fds_.emplace_back(registration.data_available_event_fd);
 
     shared_data_->descriptor_read_indices[registration.slot_index].store(
         shared_data_->descriptor_write_index.load(std::memory_order_relaxed),
         std::memory_order_relaxed);
+    registration_fd.release();
     return std::nullopt;
 }
 
@@ -383,13 +354,13 @@ Publisher::Publisher(InitialResources resources, const Flags publisher_flags)
       shutdown_event_fd_(resources.shutdown_event_fd),
       worker_exit_event_fd_(resources.worker_exit_event_fd) {}
 
-Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name, const Flags publisher_flags) {
+Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name, const Flags flags) {
     Logger::init(publisher_log_path());
 
-    const Flags execution_mode_flags = publisher_flags & (SYNCHRONOUS | ASYNCHRONOUS);
+    const Flags execution_mode_flags = flags & (SYNCHRONOUS | ASYNCHRONOUS);
     if (execution_mode_flags != SYNCHRONOUS && execution_mode_flags != ASYNCHRONOUS) {
         LOG_ERROR("PublisherModeFlagsInvalidError: flags=%u mode_flags=%u",
-            publisher_flags,
+            flags,
             execution_mode_flags);
         return CreateResult{CreateError::PublisherModeFlagsInvalid};
     }
@@ -401,68 +372,34 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
     }
 
     auto [shm_fd, shared_data] = std::get<SharedDataMapping>(shared_data_result);
+    FdGuard shm_guard(shm_fd);
 
-    int epoll_fd = -1;
-    int broker_fd = -1;
-    int space_available_event_fd = -1;
-    int publish_work_event_fd = -1;
-    int shutdown_event_fd = -1;
-    int worker_exit_event_fd = -1;
-
-    auto close_create_resources = [&]() {
-        close_fd(publish_work_event_fd);
-        close_fd(space_available_event_fd);
-        close_fd(shutdown_event_fd);
-        close_fd(worker_exit_event_fd);
-        close_fd(broker_fd);
-        close_fd(epoll_fd);
-        munmap(shared_data, sizeof(SharedData));
-        close_fd(shm_fd);
+    auto cleanup_mapping = [shm_name](SharedData *data) noexcept {
+        munmap(data, sizeof(SharedData));
+        shm_unlink(shm_name);
     };
+    std::unique_ptr<SharedData, decltype(cleanup_mapping)> mapping_guard(shared_data, cleanup_mapping);
 
-    epoll_fd = epoll_create1(0);
+    int epoll_fd = epoll_create1(0);
+    FdGuard epoll_guard(epoll_fd);
     if (epoll_fd < 0) {
         LOG_ERROR("PublisherEpollCreateError: errno=%d (%s)", errno, strerror(errno));
-        close_create_resources();
         return CreateResult{CreateError::EpollCreateFailed};
-    }
-
-    shutdown_event_fd = eventfd(0, EFD_NONBLOCK);
-    if (shutdown_event_fd < 0) {
-        LOG_ERROR("PublisherShutdownEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
-        close_create_resources();
-        return CreateResult{CreateError::ShutdownEventFdCreateFailed};
-    }
-    if (!add_fd_to_epoll(epoll_fd, shutdown_event_fd)) {
-        LOG_ERROR("PublisherShutdownEpollAddError: epoll_fd=%d event_fd=%d errno=%d (%s)",
-            epoll_fd,
-            shutdown_event_fd,
-            errno,
-            strerror(errno));
-        close_create_resources();
-        return CreateResult{CreateError::ShutdownEpollAddFailed};
-    }
-
-    worker_exit_event_fd = eventfd(0, EFD_NONBLOCK);
-    if (worker_exit_event_fd < 0) {
-        LOG_ERROR("PublisherWorkerExitEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
-        close_create_resources();
-        return CreateResult{CreateError::WorkerExitEventFdCreateFailed};
     }
 
     auto connect_result = connect_to_broker();
     auto *connect_error = std::get_if<CreateError>(&connect_result);
     if (connect_error != nullptr) {
-        close_create_resources();
         return CreateResult{*connect_error};
     }
 
-    broker_fd = std::get<int>(connect_result);
+    int broker_fd = std::get<int>(connect_result);
+    FdGuard broker_guard(broker_fd);
 
-    space_available_event_fd = eventfd(0, EFD_NONBLOCK);
+    int space_available_event_fd = eventfd(0, EFD_NONBLOCK);
+    FdGuard space_available_guard(space_available_event_fd);
     if (space_available_event_fd < 0) {
         LOG_ERROR("PublisherSpaceAvailableEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
-        close_create_resources();
         return CreateResult{CreateError::SpaceAvailableEventFdCreateFailed};
     }
     if (!add_fd_to_epoll(epoll_fd, space_available_event_fd)) {
@@ -471,7 +408,6 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
             space_available_event_fd,
             errno,
             strerror(errno));
-        close_create_resources();
         return CreateResult{CreateError::SpaceAvailableEpollAddFailed};
     }
 
@@ -481,14 +417,13 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
         shm_fd,
         space_available_event_fd);
     if (registration_result.has_value()) {
-        close_create_resources();
         return CreateResult{*registration_result};
     }
 
-    publish_work_event_fd = eventfd(0, EFD_NONBLOCK);
+    int publish_work_event_fd = eventfd(0, EFD_NONBLOCK);
+    FdGuard publish_work_guard(publish_work_event_fd);
     if (publish_work_event_fd < 0) {
         LOG_ERROR("PublisherWorkEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
-        close_create_resources();
         return CreateResult{CreateError::PublishWorkEventFdCreateFailed};
     }
     if (!add_fd_to_epoll(epoll_fd, publish_work_event_fd)) {
@@ -497,7 +432,6 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
             publish_work_event_fd,
             errno,
             strerror(errno));
-        close_create_resources();
         return CreateResult{CreateError::PublishWorkEpollAddFailed};
     }
     if (!signal_eventfd(publish_work_event_fd)) {
@@ -505,11 +439,34 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
             publish_work_event_fd,
             errno,
             strerror(errno));
-        close_create_resources();
         return CreateResult{CreateError::PublishWorkInitialSignalFailed};
     }
 
-    close_fd(shm_fd);
+    int shutdown_event_fd = -1;
+    FdGuard shutdown_guard(shutdown_event_fd);
+    int worker_exit_event_fd = -1;
+    FdGuard worker_exit_guard(worker_exit_event_fd);
+    if (flags & ASYNCHRONOUS) {
+        shutdown_event_fd = eventfd(0, EFD_NONBLOCK);
+        if (shutdown_event_fd < 0) {
+            LOG_ERROR("PublisherShutdownEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
+            return CreateResult{CreateError::ShutdownEventFdCreateFailed};
+        }
+        if (!add_fd_to_epoll(epoll_fd, shutdown_event_fd)) {
+            LOG_ERROR("PublisherShutdownEpollAddError: epoll_fd=%d event_fd=%d errno=%d (%s)",
+                epoll_fd,
+                shutdown_event_fd,
+                errno,
+                strerror(errno));
+            return CreateResult{CreateError::ShutdownEpollAddFailed};
+        }
+
+        worker_exit_event_fd = eventfd(0, EFD_NONBLOCK);
+        if (worker_exit_event_fd < 0) {
+            LOG_ERROR("PublisherWorkerExitEventFdCreateError: errno=%d (%s)", errno, strerror(errno));
+            return CreateResult{CreateError::WorkerExitEventFdCreateFailed};
+        }
+    }
 
     InitialResources resources{
         .shm_name = shm_name,
@@ -521,17 +478,28 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
         .shutdown_event_fd = shutdown_event_fd,
         .worker_exit_event_fd = worker_exit_event_fd,
     };
-    Publisher publisher(std::move(resources), publisher_flags);
+    Publisher publisher(std::move(resources), flags);
+    // Publisher 已接管映射，守卫仅放弃所有权。
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    mapping_guard.release();
+    epoll_guard.release();
+    broker_guard.release();
+    space_available_guard.release();
+    publish_work_guard.release();
+    shutdown_guard.release();
+    worker_exit_guard.release();
 
     auto recv_and_track_result = publisher.receive_and_track_initial_subscriber_registrations();
     if (recv_and_track_result.has_value()) {
         return CreateResult{*recv_and_track_result};
     }
 
-    if (!add_fd_to_epoll(epoll_fd, broker_fd)) {
+    // 注册请求发送和初始订阅者信息接收完成后，再将 broker FD 加入 epoll。
+    // add_fd_to_epoll() 会设置 O_NONBLOCK；提前调用可能使握手接收返回 EAGAIN，导致创建失败。
+    if (!add_fd_to_epoll(publisher.epoll_fd_, publisher.broker_fd_)) {
         LOG_ERROR("PublisherBrokerEpollAddError: epoll_fd=%d broker_fd=%d errno=%d (%s)",
-            epoll_fd,
-            broker_fd,
+            publisher.epoll_fd_,
+            publisher.broker_fd_,
             errno,
             strerror(errno));
         return CreateResult{CreateError::BrokerEpollAddFailed};
@@ -539,7 +507,7 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
 
     CreateResult result{std::move(publisher)};
     Publisher &created_publisher = std::get<Publisher>(result.value);
-    if ((created_publisher.flags_ & ASYNCHRONOUS) != 0) {
+    if (created_publisher.flags_ & ASYNCHRONOUS) {
         try {
             created_publisher.start_run_thread();
         } catch (const std::system_error &error) {
@@ -550,6 +518,9 @@ Publisher::CreateResult Publisher::create(TopicId topic_id, const char *shm_name
     return result;
 }
 
+// 移动/析构时不得并发调用成员函数，也不得从本对象的回调中执行。
+// 移动可能因通知清理或 worker 重启失败抛出 std::system_error（含派生异常）。
+// 内存分配失败也可能抛出 std::bad_alloc，因此移动操作不保证 noexcept。
 Publisher::Publisher(Publisher &&other) {
     take_resources_from(std::move(other));
 }
@@ -596,6 +567,18 @@ void Publisher::release_resources() {
 // 移动/析构 Publisher 时，调用方不得并发调用其任何成员函数
 void Publisher::take_resources_from(Publisher &&other) {
     const bool restart_run_thread = other.stop_run_thread(WorkerStopIntent::Transfer);
+    if (restart_run_thread) {
+        for (const int event_fd : {other.shutdown_event_fd_, other.worker_exit_event_fd_}) {
+            if (!drain_eventfd(event_fd)) {
+                const int saved_errno = errno;
+                LOG_ERROR("PublisherTransferEventDrainError: event_fd=%d errno=%d (%s)",
+                    event_fd,
+                    saved_errno,
+                    strerror(saved_errno));
+                throw std::system_error(saved_errno, std::generic_category(), "Publisher transfer event drain");
+            }
+        }
+    }
 
     flags_ = std::exchange(other.flags_, SYNCHRONOUS);
 
@@ -614,14 +597,13 @@ void Publisher::take_resources_from(Publisher &&other) {
     publish_work_event_fd_ = std::exchange(other.publish_work_event_fd_, -1);
     space_available_event_fd_ = std::exchange(other.space_available_event_fd_, -1);
     shutdown_event_fd_ = std::exchange(other.shutdown_event_fd_, -1);
-
-    if (other.worker_exit_event_fd_ >= 0 && !drain_eventfd(other.worker_exit_event_fd_)) {
-        LOG_ERROR("PublisherWorkerExitEventDrainError: event_fd=%d errno=%d (%s)",
-            other.worker_exit_event_fd_,
-            errno,
-            strerror(errno));
-    }
     worker_exit_event_fd_ = std::exchange(other.worker_exit_event_fd_, -1);
+    worker_exit_future_ = std::move(other.worker_exit_future_);
+    worker_exit_promise_ = std::move(other.worker_exit_promise_);
+
+    std::copy_n(other.events_, kMaxEvents, events_);
+    event_count_ = std::exchange(other.event_count_, 0);
+    event_index_ = std::exchange(other.event_index_, 0);
 
     data_available_event_fds_ = std::move(other.data_available_event_fds_);
     other.data_available_event_fds_.clear();
@@ -650,15 +632,28 @@ void Publisher::reset_worker_exit_notification() {
 }
 
 void Publisher::start_run_thread() {
-    {
-        std::lock_guard<std::mutex> lock(publish_state_mutex_);
-        worker_stop_intent_ = WorkerStopIntent::Destroy;
-    }
+    worker_stop_intent_.store(WorkerStopIntent::Destroy, std::memory_order_relaxed);
     reset_worker_exit_notification();
     run_thread_active_.store(true, std::memory_order_relaxed);
     try {
         run_thread_ = std::thread([this] {
-            const RunError reason = run();
+            RunError reason = RunError::None;
+            try {
+                reason = run();
+            } catch (const std::exception &error) {
+                reason = RunError::WorkerException;
+                LOG_ERROR("PublisherWorkerException: %s", error.what());
+            } catch (...) {
+                reason = RunError::WorkerException;
+                LOG_ERROR("PublisherWorkerException: unknown exception");
+            }
+            run_thread_active_.store(false, std::memory_order_relaxed);
+
+            if (reason != RunError::None) {
+                complete_outstanding_messages(PublishCompletion::WorkerFailed);
+            } else if (worker_stop_intent_ != WorkerStopIntent::Transfer) {
+                complete_outstanding_messages(PublishCompletion::WorkerStopped);
+            }
             worker_exit_promise_.set_value(reason);
 
             if (!signal_eventfd(worker_exit_event_fd_)) {
@@ -667,7 +662,6 @@ void Publisher::start_run_thread() {
                     errno,
                     strerror(errno));
             }
-            run_thread_active_.store(false, std::memory_order_relaxed);
         });
     } catch (...) {
         run_thread_active_.store(false, std::memory_order_relaxed);
@@ -676,16 +670,13 @@ void Publisher::start_run_thread() {
 }
 
 bool Publisher::stop_run_thread(const WorkerStopIntent stop_intent) {
-    const bool was_active = run_thread_active_.load(std::memory_order_relaxed);
     if (!run_thread_.joinable()) {
         return false;
     }
 
+    const bool was_active = run_thread_active_.load(std::memory_order_relaxed);
     if (was_active) {
-        {
-            std::lock_guard<std::mutex> lock(publish_state_mutex_);
-            worker_stop_intent_ = stop_intent;
-        }
+        worker_stop_intent_.store(stop_intent, std::memory_order_relaxed);
         if (!signal_eventfd(shutdown_event_fd_)) {
             LOG_ERROR("PublisherShutdownEventWriteError: event_fd=%d errno=%d (%s)",
                 shutdown_event_fd_,
@@ -813,12 +804,11 @@ Publisher::RunError Publisher::reap_dead_subscribers(uint32_t slot_index) {
 Publisher::RunError Publisher::handle_subscriber_disconnected_message(
     const char packet[],
     size_t body_len,
-    cmsghdr *cmsg) {
+    cmsghdr *) {
     if (body_len != sizeof(uint32_t)) {
         LOG_FATAL("SubscriberDisconnectPayloadSizeError: expected=%zu actual=%zu",
             sizeof(uint32_t),
             body_len);
-        close_received_fds(cmsg);
         return RunError::BrokerControlMessageProcessingFailed;
     }
 
@@ -835,7 +825,6 @@ Publisher::RunError Publisher::handle_subscriber_registered_message(
         LOG_FATAL("SubscriberRegisteredPayloadSizeError: expected=%zu actual=%zu",
             sizeof(uint32_t),
             body_len);
-        close_received_fds(cmsg);
         return RunError::BrokerControlMessageProcessingFailed;
     }
     if (cmsg == nullptr) {
@@ -849,14 +838,14 @@ Publisher::RunError Publisher::handle_subscriber_registered_message(
             cmsg->cmsg_level,
             cmsg->cmsg_type,
             broker_fd_);
-        close_received_fds(cmsg);
         return RunError::BrokerControlMessageProcessingFailed;
     }
 
     uint32_t subscriber_slot_index;
     memcpy(&subscriber_slot_index, packet + sizeof(BrokerMessageType), sizeof(subscriber_slot_index));
 
-    const int data_available_event_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    int *received_event_fd = reinterpret_cast<int *>(CMSG_DATA(cmsg));
+    const int data_available_event_fd = std::exchange(*received_event_fd, -1);
     const auto tracking_error = track_subscriber({data_available_event_fd, subscriber_slot_index});
     if (tracking_error.has_value()) {
         return RunError::DynamicSubscriberRegistrationFailed;
@@ -865,14 +854,14 @@ Publisher::RunError Publisher::handle_subscriber_registered_message(
 }
 
 Publisher::RunError Publisher::process_broker_control_messages() {
-    static char packet[kMaxMessageSize];
-    static char control[CMSG_SPACE(sizeof(int))];
+    char packet[kMaxMessageSize];
+    char control[CMSG_SPACE(sizeof(int))];
 
-    static iovec iov{};
+    iovec iov{};
     iov.iov_base = packet;
     iov.iov_len = kMaxMessageSize;
 
-    static msghdr msg{};
+    msghdr msg{};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control;
@@ -883,13 +872,6 @@ Publisher::RunError Publisher::process_broker_control_messages() {
 
         const ssize_t received_size = recvmsg(broker_fd_, &msg, 0);
 
-        if (received_size == 0) {
-            LOG_ERROR("PublisherBrokerClosed: broker_fd=%d", broker_fd_);
-            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, broker_fd_, nullptr);
-            close(broker_fd_);
-            broker_fd_ = -1;
-            return RunError::BrokerClosed;
-        }
         if (received_size < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -901,9 +883,16 @@ Publisher::RunError Publisher::process_broker_control_messages() {
                 strerror(errno));
             return RunError::BrokerControlMessageProcessingFailed;
         }
-        if (msg.msg_flags & MSG_CTRUNC) {
+        ReceivedFdsGuard received_fds(msg);
+        if (received_size == 0) {
+            LOG_ERROR("PublisherBrokerClosed: broker_fd=%d", broker_fd_);
+            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, broker_fd_, nullptr);
+            close(broker_fd_);
+            broker_fd_ = -1;
+            return RunError::BrokerClosed;
+        }
+        if (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) {
             LOG_FATAL("MsgTruncatedError");
-            close_received_fds(CMSG_FIRSTHDR(&msg));
             return RunError::BrokerControlMessageProcessingFailed;
         }
         if (received_size < static_cast<ssize_t>(sizeof(BrokerMessageType))) {
@@ -911,7 +900,6 @@ Publisher::RunError Publisher::process_broker_control_messages() {
                 sizeof(BrokerMessageType),
                 received_size,
                 broker_fd_);
-            close_received_fds(CMSG_FIRSTHDR(&msg));
             return RunError::BrokerControlMessageTooShort;
         }
 
@@ -938,7 +926,6 @@ Publisher::RunError Publisher::process_broker_control_messages() {
                     static_cast<unsigned>(static_cast<unsigned char>(packet[0])),
                     received_size,
                     broker_fd_);
-                close_received_fds(CMSG_FIRSTHDR(&msg));
                 return RunError::BrokerControlMessageProcessingFailed;
         }
 
@@ -1248,9 +1235,29 @@ Publisher::PublishResult Publisher::publish(std::span<const std::byte> payload,
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
-    epoll_event events[kMaxEvents]{};
-
     while (true) {
+        for (; event_index_ < event_count_; ++event_index_) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return PublishError::Timeout;
+            }
+
+            const int event_fd = events_[event_index_].data.fd;
+            if (event_fd == space_available_event_fd_) {
+                if (!drain_eventfd(space_available_event_fd_)) {
+                    return PublishError::EventWaitFailed;
+                }
+            } else if (event_fd == broker_fd_) {
+                const RunError run_error = process_broker_control_messages();
+                if (run_error != RunError::None) {
+                    return map_sync_run_error_to_publish_error(run_error);
+                }
+            }
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return PublishError::Timeout;
+        }
+
         const auto result = try_publish_one(payload);
         if (const auto *run_error = std::get_if<RunError>(&result)) {
             return map_sync_run_error_to_publish_error(*run_error);
@@ -1268,36 +1275,25 @@ Publisher::PublishResult Publisher::publish(std::span<const std::byte> payload,
             return PublishError::Timeout;
         }
 
-        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-        const auto max_timeout = std::chrono::milliseconds{std::numeric_limits<int>::max()};
-        const int timeout_ms = static_cast<int>(std::min(remaining, max_timeout).count());
-        const int event_count = epoll_wait(epoll_fd_, events, kMaxEvents, timeout_ms);
+        const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
 
-        if (event_count == 0) {
+        const timespec wait_timeout{
+            .tv_sec = static_cast<time_t>(seconds.count()),
+            .tv_nsec = static_cast<long>((remaining - seconds).count()),
+        };
+
+        event_count_ = epoll_pwait2(epoll_fd_, events_, kMaxEvents, &wait_timeout, nullptr);
+        event_index_ = 0;
+
+        if (event_count_ == 0) {
             return PublishError::Timeout;
         }
-
-        if (event_count < 0) {
+        if (event_count_ < 0) {
             if (errno == EINTR) {
                 continue;
             }
             return PublishError::EventWaitFailed;
-        }
-
-        for (int i = 0; i < event_count; ++i) {
-            const int event_fd = events[i].data.fd;
-
-            if (event_fd == space_available_event_fd_) {
-                if (!drain_eventfd(space_available_event_fd_)) {
-                    return map_sync_run_error_to_publish_error(
-                        RunError::SpaceAvailableEventReadFailed);
-                }
-            } else if (event_fd == broker_fd_) {
-                const RunError run_error = process_broker_control_messages();
-                if (run_error != RunError::None) {
-                    return map_sync_run_error_to_publish_error(run_error);
-                }
-            }
         }
     }
 }
@@ -1354,28 +1350,31 @@ Publisher::PublishResult Publisher::publish(std::span<const std::byte> payload) 
 }
 
 Publisher::RunError Publisher::run() {
-    epoll_event events[kMaxEvents]{};
     bool publisher_ready = true;
 
     bool running = true;
     RunError reason = RunError::None;
     while (running && reason == RunError::None) {
-        const int event_count = epoll_wait(epoll_fd_, events, kMaxEvents, -1);
-        if (event_count < 0) {
-            LOG_ERROR("PublisherEpollWaitError: errno=%d (%s)", errno, strerror(errno));
-            reason = RunError::EpollWaitFailed;
-            running = false;
-            break;
-        }
-        if (event_count == 0) {
-            LOG_ERROR("PublisherUnexpectedEpollTimeoutError");
-            reason = RunError::UnexpectedEpollTimeout;
-            running = false;
-            break;
+        if (event_index_ >= event_count_) {
+            event_index_ = 0;
+            event_count_ = epoll_wait(epoll_fd_, events_, kMaxEvents, -1);
+            if (event_count_ < 0) {
+                LOG_ERROR("PublisherEpollWaitError: errno=%d (%s)", errno, strerror(errno));
+                reason = RunError::EpollWaitFailed;
+                running = false;
+                break;
+            }
+            if (event_count_ == 0) {
+                LOG_ERROR("PublisherUnexpectedEpollTimeoutError");
+                reason = RunError::UnexpectedEpollTimeout;
+                running = false;
+                break;
+            }
+            LOG_DEBUG("epoll event_count=%d", event_count_);
         }
 
-        for (int event_index = 0; event_index < event_count; ++event_index) {
-            const int event_fd = events[event_index].data.fd;
+        while (event_index_ < event_count_) {
+            const int event_fd = events_[event_index_++].data.fd;
 
             if (event_fd == publish_work_event_fd_) {
                 reason = handle_publish_work_event(publisher_ready);
@@ -1403,23 +1402,15 @@ Publisher::RunError Publisher::run() {
 
     run_thread_active_.store(false, std::memory_order_relaxed);
 
-    {
-        std::lock_guard<std::mutex> lock(publish_state_mutex_);
-        if (reason != RunError::None) {
-            if (in_flight_message_.has_value())
-                in_flight_message_->message.completion_promise.set_value(PublishCompletion::WorkerFailed);
-            for (auto &[payload, promise] : this->pending_messages_) {
-                promise.set_value(PublishCompletion::WorkerFailed);
-            }
-        } else if (worker_stop_intent_ == WorkerStopIntent::Destroy) {
-            if (in_flight_message_.has_value())
-                in_flight_message_->message.completion_promise.set_value(PublishCompletion::WorkerStopped);
-            for (auto &[payload, promise] : this->pending_messages_) {
-                promise.set_value(PublishCompletion::WorkerStopped);
-            }
-        }
-    }
-
     LOG_INFO("publisher completed message production");
     return reason;
+}
+
+void Publisher::complete_outstanding_messages(PublishCompletion completion) {
+    std::lock_guard<std::mutex> lock(publish_state_mutex_);
+    if (in_flight_message_.has_value())
+        in_flight_message_->message.completion_promise.set_value(completion);
+    for (auto &[payload, promise] : this->pending_messages_) {
+        promise.set_value(completion);
+    }
 }

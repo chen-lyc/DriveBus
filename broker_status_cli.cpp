@@ -32,7 +32,7 @@ int main() {
     }
 
     const BrokerMessageType query_type = BrokerMessageType::StatusQuery;
-    const ssize_t sent_size = send(broker_fd, &query_type, sizeof(query_type), 0);
+    const ssize_t sent_size = send(broker_fd, &query_type, sizeof(query_type), MSG_NOSIGNAL);
     if (sent_size != static_cast<ssize_t>(kStatusQuerySize)) {
         if (sent_size < 0) std::perror("BrokerStatusQuerySendError");
         else std::fprintf(stderr, "BrokerStatusQuerySendSizeError: expected=%zu actual=%zd\n",

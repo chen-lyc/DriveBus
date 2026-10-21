@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <sys/epoll.h>
 #include <thread>
 #include <unordered_map>
 #include <variant>
@@ -81,6 +82,7 @@ class Publisher {
         PublishWorkBrokerResumeFailed,
         DataAvailableSignalFailed,
         ShutdownEventReadFailed,
+        WorkerException,
     };
 
     enum class PublishDisposition {
@@ -123,6 +125,9 @@ class Publisher {
     Publisher(const Publisher &) = delete;
     Publisher &operator=(const Publisher &) = delete;
 
+    // 移动/析构时不得并发调用成员函数，也不得从本对象的回调中执行。
+    // 移动可能因通知清理或 worker 重启失败抛出 std::system_error（含派生异常）。
+    // 内存分配失败也可能抛出 std::bad_alloc，因此移动操作不保证 noexcept。
     Publisher(Publisher &&other);
     Publisher &operator=(Publisher &&other);
 
@@ -218,6 +223,8 @@ class Publisher {
 
     RunError run();
 
+    void complete_outstanding_messages(PublishCompletion completion);
+
     std::vector<int> data_available_event_fds_{};
 
     std::unordered_map<int, size_t> subscriber_slot_index_by_data_available_event_fd_{};
@@ -229,7 +236,7 @@ class Publisher {
     std::atomic<bool> run_thread_active_{false};
     std::promise<RunError> worker_exit_promise_;
     std::shared_future<RunError> worker_exit_future_;
-    WorkerStopIntent worker_stop_intent_ = WorkerStopIntent::Destroy;
+    std::atomic<WorkerStopIntent> worker_stop_intent_ = WorkerStopIntent::Destroy;
 
     std::deque<PendingMessage> pending_messages_;
     std::mutex publish_state_mutex_;
@@ -245,6 +252,10 @@ class Publisher {
     int publish_work_event_fd_ = -1;
     int shutdown_event_fd_ = -1;
     int worker_exit_event_fd_ = -1;
+
+    int event_count_ = 0;
+    int event_index_ = 0;
+    epoll_event events_[kMaxEvents]{};
 
     int seq_ = 0;
 

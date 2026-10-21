@@ -1,5 +1,6 @@
 #include "include/subscriber.hpp"
 #include <array>
+#include <chrono>
 #include <iostream>
 
 int main() {
@@ -14,11 +15,23 @@ int main() {
     }
 
     auto &subscriber = std::get<Subscriber>(result.value);
-    const Subscriber::RunError run_error = subscriber.run();
-    if (run_error != Subscriber::RunError::None) {
-        std::cerr << "subscriber run error=" << static_cast<int>(run_error) << '\n';
-        return 2;
-    }
+    while (true) {
+        auto subscribe_result = subscriber.subscribe(std::chrono::seconds{1});
+        if (const auto *subscribe_error = std::get_if<Subscriber::SubscribeError>(&subscribe_result)) {
+            if (*subscribe_error == Subscriber::SubscribeError::Timeout) {
+                continue;
+            }
 
-    return 0;
+            std::cerr << "subscriber subscribe error=" << static_cast<int>(*subscribe_error) << '\n';
+            return 2;
+        }
+
+        for (const auto &message : std::get<Subscriber::MessageBatch>(subscribe_result)) {
+            if (!message.empty()) {
+                std::cout.write(reinterpret_cast<const char *>(message.data()),
+                    static_cast<std::streamsize>(message.size()));
+            }
+            std::cout << '\n';
+        }
+    }
 }

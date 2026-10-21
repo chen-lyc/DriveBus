@@ -5,7 +5,6 @@
 #include "include/fd_helpers.hpp"
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -17,7 +16,6 @@
 #include <queue>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -340,7 +338,7 @@ void handle_subsciber_disconect(int subscriber_fd) {
         memcpy(packet + 1, &subscriber_attachment.slot_index, sizeof(subscriber_attachment.slot_index));
 
         const ssize_t sent_size =
-            send(subscriber_attachment.publisher_fd, packet, kSubscriberDisconnectedMessageSize, 0);
+            send(subscriber_attachment.publisher_fd, packet, kSubscriberDisconnectedMessageSize, MSG_NOSIGNAL);
         if (sent_size != static_cast<ssize_t>(sizeof(packet))) {
             if (sent_size < 0) {
                 LOG_ERROR("SubscriberDisconnectSendError: publisher_fd=%d slot=%u errno=%d (%s)",
@@ -472,7 +470,7 @@ void handle_publisher_disconnect(int publisher_fd) {
             memcpy(packet, &message_type, sizeof(BrokerMessageType));
             memcpy(packet + sizeof(BrokerMessageType), &subscriber_attachment_it->attachment_id, sizeof(AttachmentId));
 
-            const ssize_t sent_size = send(subscriber_fd, packet, kPublisherDisconnectedMessageSize, 0);
+            const ssize_t sent_size = send(subscriber_fd, packet, kPublisherDisconnectedMessageSize, MSG_NOSIGNAL);
             if (sent_size != static_cast<ssize_t>(sizeof(packet))) {
                 if (sent_size < 0) {
                     LOG_ERROR("PublisherDisconnectSendError: subscriber_fd=%d attachment_id=%llu errno=%d (%s)",
@@ -524,7 +522,24 @@ void handle_publisher_disconnect(int publisher_fd) {
 }
 
 int main() {
+    sigset_t shutdown_signals;
+    sigemptyset(&shutdown_signals);
+    sigaddset(&shutdown_signals, SIGINT);
+    sigaddset(&shutdown_signals, SIGTERM);
+
+    if (sigprocmask(SIG_BLOCK, &shutdown_signals, nullptr) < 0) {
+        const int saved_errno = errno;
+        std::cerr << "BrokerSignalMaskError: errno=" << saved_errno << " (" << strerror(saved_errno) << ")\n";
+        return 1;
+    }
+
     Logger::init(broker_log_path());
+
+    int shutdown_fd = signalfd(-1, &shutdown_signals, SFD_NONBLOCK);
+    if (shutdown_fd < 0) {
+        LOG_FATAL("BrokerShutdownSignalFdCreateError: errno=%d (%s)", errno, strerror(errno));
+        return 1;
+    }
 
     const char *unix_path = "/tmp/broker.sock";
     if (unlink(unix_path) < 0 && errno != ENOENT) {
@@ -561,34 +576,18 @@ int main() {
         return 1;
     }
 
-    if (!add_fd_to_epoll(epoll_fd, listen_fd)) {
-        LOG_FATAL("BrokerListenEpollAddError: epoll_fd=%d listen_fd=%d errno=%d (%s)",
-            epoll_fd,
-            listen_fd,
-            errno,
-            strerror(errno));
-        return 1;
-    }
-
-    sigset_t shutdown_signals;
-    sigemptyset(&shutdown_signals);
-    sigaddset(&shutdown_signals, SIGINT);
-    sigaddset(&shutdown_signals, SIGTERM);
-
-    if (sigprocmask(SIG_BLOCK, &shutdown_signals, nullptr) < 0) {
-        LOG_FATAL("BrokerSignalMaskError: errno=%d (%s)", errno, strerror(errno));
-        return 1;
-    }
-
-    int shutdown_fd = signalfd(-1, &shutdown_signals, SFD_NONBLOCK);
-    if (shutdown_fd < 0) {
-        LOG_FATAL("BrokerShutdownSignalFdCreateError: errno=%d (%s)", errno, strerror(errno));
-        return 1;
-    }
     if (!add_fd_to_epoll(epoll_fd, shutdown_fd)) {
         LOG_FATAL("BrokerShutdownSignalEpollAddError: epoll_fd=%d shutdown_fd=%d errno=%d (%s)",
             epoll_fd,
             shutdown_fd,
+            errno,
+            strerror(errno));
+        return 1;
+    }
+    if (!add_fd_to_epoll(epoll_fd, listen_fd)) {
+        LOG_FATAL("BrokerListenEpollAddError: epoll_fd=%d listen_fd=%d errno=%d (%s)",
+            epoll_fd,
+            listen_fd,
             errno,
             strerror(errno));
         return 1;
@@ -690,7 +689,6 @@ int main() {
                             break;
                         }
 
-                        LOG_ERROR("BrokerControlRecvError: fd=%d errno=%d (%s)", fd, errno, strerror(errno));
                         auto it = role_by_fd.find(fd);
                         if (it == role_by_fd.end()) {
                             LOG_FATAL("BrokerRecvFdRoleMissingError: fd=%d", fd);
@@ -705,6 +703,10 @@ int main() {
                         client_fds.erase(client_it);
 
                         auto role = it->second;
+                        LOG_INFO("BrokerControlDisconnected: fd=%d role=%d",
+                            fd,
+                            static_cast<int>(role));
+
                         if (role == BrokerRole::Subscriber) handle_subsciber_disconect(fd);
                         else if (role == BrokerRole::Publisher) handle_publisher_disconnect(fd);
                         break;
@@ -749,7 +751,7 @@ int main() {
                             msg.msg_iovlen = iov.size();
 
                             const size_t expected_size = sizeof(sent_type) + payload.size();
-                            const ssize_t sent_size = sendmsg(fd, &msg, 0);
+                            const ssize_t sent_size = sendmsg(fd, &msg, MSG_NOSIGNAL);
                             if (sent_size != static_cast<ssize_t>(expected_size)) {
                                 if (sent_size < 0) {
                                     LOG_ERROR("BrokerStatusSnapshotSendError: fd=%d errno=%d (%s)",
@@ -999,7 +1001,7 @@ int main() {
 
                             uint32_t registered_subscriber_count = static_cast<uint32_t>(subscriber_count);
                             const ssize_t subscriber_count_sent_size =
-                                send(fd, &registered_subscriber_count, sizeof(registered_subscriber_count), 0);
+                                send(fd, &registered_subscriber_count, sizeof(registered_subscriber_count), MSG_NOSIGNAL);
                             if (subscriber_count_sent_size !=
                                 static_cast<ssize_t>(sizeof(registered_subscriber_count))) {
                                 if (subscriber_count_sent_size < 0) {
