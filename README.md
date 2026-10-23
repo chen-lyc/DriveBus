@@ -1,44 +1,322 @@
 # DriveBus
 
-> 一个 Linux / C++ 跨进程发布订阅实现：`broker.out` 按 topic 建立发布者与订阅者的连接关系，`b.out` 创建并写入共享内存，`a.out` 接收通知后从该共享内存读取。当前构建目标只有这三个程序。 [源码](Makefile#L16-L35) [broker](broker.cpp#L235-L299) [发布者](b.cpp#L302-L348) [订阅者](a.cpp#L176-L223)
+## 下载项目
 
-## 它把什么放在哪条路径
+```bash
+git clone https://github.com/chen-lyc/DriveBus.git
+cd DriveBus
+```
 
-控制面负责注册、slot 与文件描述符交接：publisher 把 topic 和共享内存 FD 交给 broker；subscriber 把 topic 列表交给 broker；broker 创建 `eventfd`，将共享内存 FD 发给 subscriber，并将 `eventfd` 和 slot 发给 publisher 与 subscriber。 [发布注册](b.cpp#L343-L348) [订阅注册](a.cpp#L211-L220) [broker 分配与交接](broker.cpp#L352-L435) [FD 传递](src/fd_helpers.cpp#L20-L68)
+也可以在 [GitHub 仓库](https://github.com/chen-lyc/DriveBus) 页面选择 **Code → Download ZIP**，解压后进入项目目录。
 
-数据面在 `SharedData` 中：它保存 descriptor ring、最多 16 个 slot 的读下标、分档 free list、每个 chunk 的引用位集合和 `data` 区。publisher 写 descriptor/data；subscriber 映射同一对象后读取它。 [共享布局](include/shared_memory_layout.hpp#L8-L77) [发布写入](b.cpp#L435-L468) [订阅端映射](a.cpp#L323-L334) [订阅端读取](a.cpp#L69-L153)
+## 快速上手
 
-当前 broker 的接收分支处理注册、FD 交接和断连；`data` 写入发生在 `b.cpp`，`data` 读取发生在 `a.cpp`。 [broker 的注册/断连处理](broker.cpp#L74-L145) [publisher 的消息循环](b.cpp#L374-L474) [订阅端读取](a.cpp#L69-L153)
+### 1. 准备环境并编译
 
-## 一条消息的当前路径
+项目依赖 Linux、支持 C++20 的 C++ 编译器、GNU Make 和 POSIX 线程库。使用了 `epoll_pwait2`，需要内核及 C 库提供对应支持。Ubuntu / Debian 可先安装：
 
-1. publisher 按消息长度选择分档，从对应 free-list head 取一个 chunk；当前布局有 5 档，chunk 大小为 16 / 128 / 256 / 512 / 1024 B。 [分档](include/shared_memory_layout.hpp#L12-L27) [选择与分配](include/shared_memory_layout_helpers.hpp#L3-L9) [head 移动](b.cpp#L400-L447)
-2. publisher 写 `{offset, len}` descriptor、`kMagic` 和递增 sequence，然后按已登记 slot 组成该 chunk 的持有位集合。 [写入](b.cpp#L439-L464)
-3. publisher 用 release store 发布写下标，再向每个已登记的 `eventfd` 写入 1。subscriber 在 `epoll` 收到 `eventfd` 后 acquire-load 写下标，复制 descriptor，再读取 `data`。 [发布与通知](b.cpp#L466-L473) [唤醒与消费](a.cpp#L242-L260) [连续区间读取](a.cpp#L163-L174)
-4. subscriber 清除自己的 slot bit，随后发布自己的读下标；只有 `fetch_and` 返回的旧值等于该 bit 时，代码才把 chunk 接回对应 size class 的 free-list tail。 [消费后的归还](a.cpp#L120-L152)
-5. 当 broker 在 subscriber FD 的 `recvmsg()` 返回 0 分支处理关闭时，它向关联 publisher 发 `SubscriberDisconnected(slot)`；publisher 清除该 slot 从 read index 到 write index 的 bit（绕回时拆为两段），将 read index 设为 `kInvalidIndex`，再移除并关闭对应 `eventfd`。 [broker 断连入口](broker.cpp#L317-L347) [断连转发](broker.cpp#L74-L145) [publisher 回收](b.cpp#L182-L198) [控制消息处理](b.cpp#L216-L262)
+```bash
+sudo apt update
+sudo apt install -y build-essential git
+```
 
-## 这些机制为什么不是更简单的版本
+在项目根目录编译：
 
-- ring 的写前代码先扫描有效的 subscriber read index，并在 ring 空间条件不满足时等待，而不是无条件推进写下标。 [最慢读下标](b.cpp#L122-L140) [写前等待](b.cpp#L386-L394)
-- 在 broker 正常分配唯一 slot 的路径下，`chunk_reference_counts` 按 slot bit mask 操作：发布端按 slot 构造 mask；正常消费和死亡回收都清除指定 bit，只有 `fetch_and` 返回的旧值等于该 bit 时，代码才归还 chunk。死亡回收据此按 slot 清除其 descriptor 范围内的持有位。 [slot 分配](broker.cpp#L393-L519) [发布 mask](b.cpp#L454-L464) [正常清位](a.cpp#L120-L152) [死亡清位](b.cpp#L142-L197)
-- publisher 执行 `track_subscriber()` 时，把新 subscriber 的共享读下标设为它当时读取的 write index；订阅端首次消费前会从该共享下标初始化本地 cursor。 [注册起点](b.cpp#L200-L212) [本地 cursor 初始化](a.cpp#L156-L161)
-- `eventfd` 在当前实现中用于唤醒；payload 仍由 subscriber 从共享内存读取。 [eventfd 创建与交接](broker.cpp#L423-L432) [写端通知](b.cpp#L470-L473) [读端等待](a.cpp#L222-L260)
+```bash
+make -j2
+```
 
-## 当前不能宣称什么
+自动创建 `build/` 目录，并将所有可执行文件生成到其中：
 
-- 当前 `kill -9` 生命周期脚本不能按默认调用进入其断言：脚本无参数启动 `a.out` / `b.out`，而当前程序分别要求 topic 参数、以及 topic 和共享内存名。 [脚本启动](tests/test_two_subscribers_kill9.sh#L482-L500) [publisher 参数](b.cpp#L302-L307) [subscriber 参数](a.cpp#L176-L182)
-- 即使补齐启动参数，脚本第一个 replacement case 固定期待 slot 1；当前 broker 会把断连 slot 放回最小堆，随后优先重新分配 slot 0。 [脚本断言](tests/test_two_subscribers_kill9.sh#L579-L581) [slot 初始化/归还/分配](broker.cpp#L52-L56) [归还](broker.cpp#L102-L119) [分配](broker.cpp#L423-L425)
-- `b.out` 的 `main()` 把 `argv[1]` 用作 topic、`argv[2]` 用作共享内存名；发布循环自己生成随机长度、`magic`、sequence 和填充字符，没有从这两个 CLI 字段读取调用者给出的消息体。 [参数](b.cpp#L302-L310) [生成与写入](b.cpp#L26-L43) [主循环](b.cpp#L374-L477)
-- `BrokerMessageType` 中没有 unsubscribe 消息类型，`a.cpp` 中也没有发送 unsubscribe 的路径；当前 subscriber 清理入口是 broker 对 socket EOF 或接收错误的处理。 [协议枚举](include/broker_protocol.hpp#L6-L13) [subscriber 发送路径](a.cpp#L211-L220) [broker 清理入口](broker.cpp#L317-L347)
-- 在正常 subscriber 归还和 publisher 死亡回收的两段 tail 更新中，代码均为 `load → 写 next → store`；这两段更新处未见 CAS 或覆盖该 tail 更新的锁，因此 README 不把多订阅者 allocator 回收写成已验证安全。 [正常归还](a.cpp#L149-L152) [死亡回收归还](b.cpp#L171-L174)
-- `tests/tsan/` 是两个独立 harness 源文件；当前 Makefile 没有 TSan 或 test target。 [harness](tests/tsan/harness.cpp#L29-L73) [ring harness](tests/tsan/ring_harness.cpp#L9-L21) [Makefile](Makefile#L1-L35)
+| 程序 | 用途 |
+| --- | --- |
+| `build/broker.out` | 管理 topic 注册、发布订阅关系及文件描述符交接 |
+| `build/pub_node` | 同步发布样例，每秒向 `Camera` topic 发送一条文本消息 |
+| `build/sub_node` | 同步订阅样例，接收并打印 `Camera` topic 的消息 |
+| `build/broker-status` | 查询 broker 当前的注册和连接状态 |
 
-## 继续阅读（不在这里重写）
+强制重新编译可执行 `make rebuild`；单独编译样例可执行 `make pub_node sub_node`；清理这四个程序可执行 `make clean`。`build/` 已加入 Git 忽略规则。当前 Makefile 默认启用 `ENABLE_DEBUG_CHECKS`，所有参与通信的程序应使用相同的头文件和编译选项重新构建。
 
-- [控制协议](docs/broker_protocol.md)
-- [共享内存、ring、memory order 与 eventfd 学习/设计笔记](notes/01-spsc-ring/README.md)
-- [历史 bug 与调试复盘索引](notes/README.md)
-- [动态订阅者测试设计说明](tests/README.md)
+### 2. 启动 broker
 
-详细的模块边界、内存池、引用位图、测试固定值和未完成项见 [FACTS.md](FACTS.md)。
+打开终端一，在项目根目录运行：
+
+```bash
+./build/broker.out
+```
+
+broker 使用固定的 Unix socket 地址 `/tmp/broker.sock`。保持该终端运行，同一环境中运行一个 broker 实例即可。
+
+### 3. 启动订阅样例
+
+打开终端二，进入同一项目目录：
+
+```bash
+./build/sub_node
+```
+
+出现以下输出后，程序将等待消息：
+
+```text
+sub_node: waiting for Camera messages (Ctrl+C to stop)
+```
+
+### 4. 启动发布样例
+
+打开终端三，进入同一项目目录：
+
+```bash
+./build/pub_node
+```
+
+发布端每次成功发布后输出：
+
+```text
+pub_node: publishing to Camera (Ctrl+C to stop)
+published: Hello, DriveBus!
+published: Hello, DriveBus!
+```
+
+订阅端对应输出：
+
+```text
+received: Hello, DriveBus!
+received: Hello, DriveBus!
+```
+
+也可以传入自定义文本；包含空格时需加引号：
+
+```bash
+./build/pub_node "camera frame ready"
+```
+
+先停止原来的 `pub_node` 再运行上述命令。样例使用固定共享内存名称 `/drivebus_pub_node_camera`，运行多个发布端时需为每个实例设置不同的共享内存名称。
+
+### 5. 查看状态并退出
+
+另开终端执行：
+
+```bash
+./build/broker-status
+```
+
+状态快照包含已注册连接、角色、topic 路由及订阅槽位。验证多订阅者接收时，先停止 `pub_node`，再启动第二个 `./build/sub_node`，最后重新启动发布样例。
+
+两个样例均支持 **Ctrl+C** 退出。演示结束时先退出发布端和订阅端，再退出 broker；样例退出后由对象析构释放相应资源。
+
+发布端未连接到订阅者，或共享内存暂时没有可用空间时，会输出 `publish timeout` 并继续等待；订阅端等待超时会继续接收。详细日志位于运行目录下的 `logs/standalone/`；设置 `DRIVEBUS_RUN_ID` 环境变量后，日志写入 `logs/<运行标识>/`。
+
+完整样例源码：[pub_node.cpp](pub_node.cpp) · [sub_node.cpp](sub_node.cpp)。
+
+文档导航：[接口与使用样例](#接口与使用样例) · [完整使用指南](docs/usage.md) · [工作原理](#工作原理) · [当前配置与边界](#当前配置与边界)。
+
+## 项目简介
+
+DriveBus 是基于 **Linux / C++20** 的本机跨进程发布订阅通信项目，用于探索中间件中的共享内存传输、消息通知、资源所有权和连接生命周期管理。
+
+发布者和订阅者按 `TopicId` 建立关联：broker 负责注册与资源交接，消息正文通过发布者创建的共享内存传递。当前提供 `Publisher`、`Subscriber` C++ 接口，以及可直接运行的发布、订阅和状态查询程序。
+
+项目处于持续开发阶段，适合系统编程学习与通信机制实验。
+
+## 主要功能
+
+- **按 topic 发布订阅**：提供 `Camera`、`Lidar`、`VehicleState` 三个 topic；同一 topic 可关联多个发布者和订阅者。
+- **共享内存数据通路**：每个发布者创建独立的 `SharedData`，通过描述符环和分档内存池传递消息。
+- **事件通知**：使用 `eventfd` 通知数据与空间可用，通过 `epoll` 等待控制和数据事件。
+- **同步与异步接口**：同步发布、订阅支持超时；异步发布返回完成凭据，异步订阅通过回调处理数据。
+- **连接生命周期处理**：管理动态加入、断连通知、订阅槽位和未消费消息引用的回收。
+- **运行状态与日志**：提供 `broker-status` 状态快照和按进程记录的日志。
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    P[Publisher] -->|注册 topic / 交接 FD| B[Broker]
+    S[Subscriber] -->|订阅 topic| B
+    B -->|共享内存 FD / 通知 FD / 槽位| S
+    B -->|订阅者通知 FD / 槽位| P
+    P -->|写入消息和描述符| M[(共享内存)]
+    M -->|读取消息| S
+    P -. 数据可用 eventfd .-> S
+    S -. 空间可用 eventfd .-> P
+```
+
+1. 发布者创建共享内存，通过 Unix domain `SOCK_SEQPACKET` 向 broker 注册 topic；文件描述符通过 `SCM_RIGHTS` 交接。
+2. 订阅者注册 topic 列表，broker 建立与对应发布者的关联，分配订阅槽位并交接共享内存与通知 FD。
+3. 发布者将正文和内部消息头写入内存池，写入 `{offset, len}` 描述符，再发布写下标并通知订阅者。
+4. 订阅者读取消息、推进自己的读下标并清除引用位；最后一个持有者归还 chunk，并通知发布者空间可用。
+5. 端点断连后，broker 通知关联端点清理相应的订阅关系或映射资源。
+
+broker 处理控制消息；消息正文由发布端和订阅端通过共享内存交换。当前发布 API 会复制调用者的 payload，同步订阅返回自有的字节数组，接口使用方式见下文。
+
+## 接口与使用样例
+
+`pub_node` 和 `sub_node` 是同步模式的命令行样例。`pub_node` 支持 `[message]` 与 `--help`，`sub_node` 使用源码中配置的 topic 列表；异步模式、多 topic 和二进制数据通过 C++ API 使用。
+
+### 选择收发模式
+
+| 场景 | 创建模式 | 使用接口 | 返回或交付方式 |
+| --- | --- | --- | --- |
+| 同步发布 | `Publisher::SYNCHRONOUS` | `publish(payload, timeout)` | 成功时已写入共享内存；失败返回 `PublishError` |
+| 异步发布 | `Publisher::ASYNCHRONOUS` | `publish(payload)` | 返回入队凭据，通过 `ticket.future` 获取最终状态 |
+| 同步订阅 | `Subscriber::SYNCHRONOUS` | `subscribe(timeout)` | 返回自有的 `MessageBatch` 或 `SubscribeError` |
+| 异步订阅 | `Subscriber::ASYNCHRONOUS` | 创建时传入回调 | 后台线程调用 `callback(char *, size_t)` |
+
+默认创建模式为同步；同一对象的 `SYNCHRONOUS` 与 `ASYNCHRONOUS` 应二选一。发布重载与创建模式不匹配会返回 `ModeMismatch`；异步订阅对象由后台线程消费消息，应通过回调接收数据。
+
+### 同步发布与订阅
+
+完整的创建、循环收发、超时和退出处理见 [pub_node.cpp](pub_node.cpp) 与 [sub_node.cpp](sub_node.cpp)。取得同步 `publisher` 后，字符串可作为字节视图发布：
+
+```cpp
+const std::string_view message = "Hello, DriveBus!";
+const auto payload = std::as_bytes(std::span{message.data(), message.size()});
+const auto result = publisher.publish(payload, std::chrono::seconds{1});
+if (const auto *error = std::get_if<Publisher::PublishError>(&result)) {
+    if (*error == Publisher::PublishError::Timeout) {
+        // 本次等待超时；由业务决定是否重试。
+    } else {
+        std::cerr << "publish error=" << static_cast<int>(*error) << '\n';
+    }
+}
+```
+
+同步订阅的 `MessageBatch` 中，每条消息都是 `std::vector<std::byte>`，可以在下一次 `subscribe()` 后继续持有。发布成功只确认写入共享内存，订阅者的业务处理可能尚未完成。
+
+### 异步发布：提交后检查最终状态
+
+先通过 `Publisher::create(topic, shm_name, Publisher::ASYNCHRONOUS)` 创建发布者，再使用不带超时参数的重载。下面代码假定 `publisher`、`payload` 已准备好：
+
+```cpp
+const auto result = publisher.publish(payload);
+if (const auto *error = std::get_if<Publisher::PublishError>(&result)) {
+    std::cerr << "enqueue error=" << static_cast<int>(*error) << '\n';
+} else {
+    const auto &ticket = std::get<Publisher::PublishTicket>(result);
+    if (ticket.future.wait_for(std::chrono::seconds{1}) == std::future_status::ready) {
+        const auto completion = ticket.future.get();
+        if (completion != Publisher::PublishCompletion::Published) {
+            std::cerr << "completion=" << static_cast<int>(completion) << '\n';
+        }
+    } else {
+        // 一秒内尚未完成；凭据仍然有效，可稍后再次查询。
+    }
+}
+```
+
+`ticket.disposition` 描述本次提交结果，`ticket.future` 描述该消息的最终结果，两者含义不同：
+
+| 状态 | 含义 |
+| --- | --- |
+| `Enqueued` | 当前消息已入队，尚未确认发布 |
+| `EnqueuedAfterOverwritingOldest` | 当前消息已入队，并覆盖了一条旧待发布消息 |
+| `PublishCompletion::Published` | 当前消息已写入共享内存 |
+| `Overwritten` / `WorkerStopped` / `WorkerFailed` | 当前消息被覆盖，或因后台线程停止、失败而结束 |
+
+当前异步待发布容量为 64 条，包含正在处理的消息。达到上限时会覆盖旧待发布消息，因此业务需要检查完成凭据。`wait_for()` 超时只结束本次等待，消息可能稍后完成。
+
+完整程序、编译命令和状态说明见 [异步发布指南](docs/usage.md#异步发布)。
+
+### 异步订阅：在后台线程接收
+
+创建时提供回调即可持续接收；应用应保持创建结果中的订阅对象存活：
+
+```cpp
+const std::array<TopicId, 1> topics = {TopicId::Camera};
+auto created = Subscriber::create(topics, Subscriber::ASYNCHRONOUS,
+    [](char *data, size_t size) {
+        const std::string message(data, size);
+        std::cout << "received: " << message << std::endl;
+    });
+if (const auto *error = std::get_if<Subscriber::CreateError>(&created.value)) {
+    std::cerr << "subscriber create error=" << static_cast<int>(*error) << '\n';
+}
+```
+
+回调在订阅者后台线程上执行。`data` 指向共享内存，仅在本次回调期间使用；需要留给后续业务处理时，应在回调返回前复制。即使参数类型是 `char *`，也应按只读数据处理，避免影响其他订阅者。回调内的耗时工作会推迟消息引用释放。
+
+完整程序演示如何保持对象存活、将数据交给主线程并退出，见 [异步订阅指南](docs/usage.md#异步订阅)。
+
+### 多 topic、二进制数据与后台状态
+
+| 需求 | 使用方式与边界 | 详细说明 |
+| --- | --- | --- |
+| 订阅多个 topic | 向 `Subscriber::create()` 传入多个 `TopicId`；当前消息返回值和回调均不附带 topic 元数据 | [多 topic 与多发布者](docs/usage.md#多-topic-与多发布者) |
+| 同一 topic 多发布者 | 每个实例使用不同的共享内存名称；各自维护独立消息顺序 | [多 topic 与多发布者](docs/usage.md#多-topic-与多发布者) |
+| 二进制 payload | 传入字节 span，按长度解码；编码格式由业务约定 | [数据与生命周期](docs/usage.md#数据与生命周期) |
+| 监控异步线程退出 | 使用 `worker_exit_future()`；也可将 `worker_exit_event_fd()` 加入自己的事件循环 | [后台线程与错误处理](docs/usage.md#后台线程与错误处理) |
+| 集成到业务程序 | 引入头文件并链接对应实现源码，统一 C++20、线程和调试布局选项 | [编译与运行完整示例](docs/usage.md#编译与运行完整示例) |
+
+完整错误枚举与签名见 [publisher.hpp](include/publisher.hpp)、[subscriber.hpp](include/subscriber.hpp)。当前尚未提供独立库的安装与打包目标。
+
+## 项目结构
+
+```text
+DriveBus/
+├── README.md                        # 下载、运行与项目说明
+├── Makefile                         # 构建四个可执行程序
+├── build/                           # 自动生成的可执行文件（Git 忽略）
+├── broker.cpp                       # broker 注册、路由与生命周期管理
+├── broker_status_cli.cpp            # 状态查询工具
+├── pub_node.cpp                     # 同步发布样例
+├── sub_node.cpp                     # 同步订阅样例
+├── include/
+│   ├── publisher.hpp                # 发布 API
+│   ├── subscriber.hpp               # 订阅 API
+│   ├── broker_protocol.hpp          # 控制消息、TopicId 与 AttachmentId
+│   ├── shared_memory_layout.hpp     # 共享内存布局与容量配置
+│   ├── shared_memory_layout_helpers.hpp
+│   ├── fd_helpers.hpp               # FD 操作与所有权辅助工具
+│   └── logger.h                     # 日志接口
+├── src/                             # 发布、订阅、FD 与日志实现
+├── tests/                           # 生命周期脚本与独立 TSan 实验
+├── docs/                            # 使用指南、协议及设计文档
+│   └── usage.md                     # 完整异步示例与 API 使用边界
+└── notes/                           # 学习笔记与调试记录
+```
+
+## 当前配置与边界
+
+| 项目 | 当前实现 |
+| --- | --- |
+| 通信范围 | 同一 Linux 主机上的进程 |
+| 控制 socket | `/tmp/broker.sock` |
+| topic 定义 | `Camera = 1`、`Lidar = 2`、`VehicleState = 3` |
+| 订阅注册容量 | 单次最多 5 个 topic ID；当前已定义 3 个有效 topic |
+| 订阅槽位 | 每个发布者最多 16 个订阅者 |
+| 描述符环 | 16 个槽位，保留一个空位区分满与空 |
+| 内存池档位 | 16 / 128 / 256 / 512 / 1024 字节 |
+| 各档 chunk 数量 | 64 / 32 / 16 / 8 / 8 |
+| 数据池大小 | 21,504 字节，不含 `SharedData` 的其他元数据 |
+| 单条业务 payload 上限 | `1024 - 2 * sizeof(int)` 字节；本机 4 字节 `int` 时为 1016 字节 |
+
+上述定义见 [共享内存布局](include/shared_memory_layout.hpp)、[控制协议头](include/broker_protocol.hpp) 和 [发布接口](include/publisher.hpp)。修改布局或 `ENABLE_DEBUG_CHECKS` 后，需要统一重编所有通信端点。
+
+- 没有订阅者时，当前发布路径等待订阅者；慢订阅者或内存池空间不足也会产生背压，同步调用可能超时。
+- 同步发布持续成功时，可能延迟处理 broker 的新增订阅者通知，导致运行中加入的订阅者暂时收不到消息；当前同步样例建议先启动所有订阅者，再启动发布者。
+- 新订阅者从关联建立时的写下标开始消费，当前没有历史消息回放。
+- 当前没有跨主机传输、持久化、协议版本协商或身份认证；尚未提供完整 QoS 策略。
+- 本项目尚未建立完整的自动化回归与性能基线；多订阅者并发回收和异常退出的全部时序仍需专项验证。
+
+## 验证与开发
+
+编译检查：
+
+```bash
+make rebuild
+git diff --check
+```
+
+功能验证可按上面的三个终端运行样例，检查发布内容与接收内容一致，再通过 `broker-status` 查看关联状态。验证两个订阅者时，先启动两个 `sub_node` 再启动 `pub_node`；重新启动发布端还可观察共享内存释放与重新关联。
+
+`tests/test_two_subscribers_kill9.sh` 仍启动旧的 `a.out` / `b.out`，与当前构建目标及样例输出不匹配，需要适配后才能用于当前版本。`tests/tsan/` 是独立实验代码，当前没有统一的 `make test` 目标。历史协议文档和学习笔记可能保留旧接口，当前行为以 `include/` 与 `src/` 源码为准。
+
+## 参与贡献
+
+欢迎通过 [Issues](https://github.com/chen-lyc/DriveBus/issues) 反馈问题或提出设计讨论，通过 [Pull Requests](https://github.com/chen-lyc/DriveBus/pulls) 提交改进。
+
+报告问题时请提供运行环境、构建命令、复现步骤和相关日志；提交代码时请说明行为变化及实际验证方式。涉及共享内存布局或控制协议的修改，应同时检查发布端、订阅端与 broker 的兼容性。
+
+## 许可证
+
+仓库当前尚未提供 `LICENSE` 文件；使用、修改或分发前，请与维护者确认授权范围。
